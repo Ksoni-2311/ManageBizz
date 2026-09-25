@@ -11,3 +11,6 @@ AGENT.md
 NexusOps_PROJECT_SPEC.md
 .env
 apps/api/.env:6
+.env
+.env.*
+!.env.example
