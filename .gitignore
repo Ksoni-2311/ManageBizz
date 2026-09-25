@@ -1,6 +1,7 @@
 node_modules/
 apps/*/node_modules/
 apps/api/dist/
+apps/api/*.log
 apps/api/uploads/crm/
 apps/api/uploads/tasks/
 apps/api/uploads/calendar/
