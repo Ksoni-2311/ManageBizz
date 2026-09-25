@@ -14,3 +14,4 @@ apps/api/.env:6
 .env
 .env.*
 !.env.example
+secrets
