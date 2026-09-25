@@ -1,0 +1,8 @@
+{
+    "chat.tools.terminal.autoApprove": {
+        "/^Write-Output \\('nested body-parser: ' \\+ \\(Test-Path \\.\\\\node_modules\\\\\\.pnpm\\\\express@4\\.22\\.3\\\\node_modules\\\\body-parser\\)\\); Write-Output \\('nested rollup: ' \\+ \\(Test-Path \\.\\\\node_modules\\\\\\.pnpm\\\\vite@5\\.4\\.21_@types\\+node@20\\.19\\.43\\\\node_modules\\\\rollup\\)\\);$/": {
+            "approve": true,
+            "matchCommandLine": true
+        }
+    }
+}

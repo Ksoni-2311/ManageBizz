@@ -1,0 +1,11 @@
+node_modules/
+apps/*/node_modules/
+apps/api/dist/
+apps/api/uploads/crm/
+apps/api/uploads/tasks/
+apps/api/uploads/calendar/
+apps/web/dist/
+packages/*/dist/
+.env.example
+AGENT.md
+NexusOps_PROJECT_SPEC.md

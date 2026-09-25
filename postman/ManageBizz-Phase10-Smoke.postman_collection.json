@@ -1,0 +1,136 @@
+{
+  "info": {
+    "name": "ManageBizz API smoke test",
+    "description": "Five-request local smoke test: register, propose a task, approve it, inspect the completed run, and inspect its trace. Uses the mock agent parser and an in-memory task service.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    { "key": "baseUrl", "value": "http://localhost:5000" },
+    { "key": "token", "value": "" },
+    { "key": "runId", "value": "" },
+    { "key": "proposalId", "value": "" },
+    { "key": "testEmail", "value": "" }
+  ],
+  "item": [
+    {
+      "name": "1. Register test user",
+      "request": {
+        "method": "POST",
+        "header": [{ "key": "Content-Type", "value": "application/json" }],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"name\": \"ManageBizz Postman Test\",\n  \"email\": \"mb-postman-{{$guid}}@example.test\",\n  \"password\": \"PostmanTest-{{$guid}}\"\n}"
+        },
+        "url": "{{baseUrl}}/api/auth/register",
+        "description": "Creates a fresh local test account and saves its JWT as the collection variable `token`. Requires MongoDB to be available."
+      },
+      "event": [{
+        "listen": "test",
+        "script": {
+          "type": "text/javascript",
+          "exec": [
+            "pm.test('registration succeeded', function () { pm.response.to.have.status(200); });",
+            "const body = pm.response.json();",
+            "pm.test('registration returned a token', function () { pm.expect(body.success).to.eql(true); pm.expect(body.token).to.be.a('string').and.not.empty; });",
+            "if (body.token) pm.collectionVariables.set('token', body.token);"
+          ]
+        }
+      }]
+    },
+    {
+      "name": "2. Propose task action",
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "Content-Type", "value": "application/json" },
+          { "key": "Authorization", "value": "Bearer {{token}}" }
+        ],
+        "body": { "mode": "raw", "raw": "{\n  \"goal\": \"Create task titled \\\"Postman smoke test task\\\"\"\n}" },
+        "url": "{{baseUrl}}/api/agent/runs",
+        "description": "Starts the real application-level agent run. The task should be proposed and await approval; it must not execute yet."
+      },
+      "event": [{
+        "listen": "test",
+        "script": {
+          "type": "text/javascript",
+          "exec": [
+            "pm.test('run was accepted', function () { pm.response.to.have.status(200); });",
+            "const body = pm.response.json();",
+            "pm.test('run awaits approval', function () { pm.expect(body.success).to.eql(true); pm.expect(body.status).to.eql('awaiting_approval'); });",
+            "const proposal = (body.actions || []).find(function (action) { return action.lifecycle === 'PROPOSED'; });",
+            "pm.test('task proposal is present', function () { pm.expect(body.runId).to.be.a('string').and.not.empty; pm.expect(proposal).to.exist; });",
+            "if (body.runId) pm.collectionVariables.set('runId', body.runId);",
+            "if (proposal) pm.collectionVariables.set('proposalId', proposal.id);"
+          ]
+        }
+      }]
+    },
+    {
+      "name": "3. Approve and execute proposed task",
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "Content-Type", "value": "application/json" },
+          { "key": "Authorization", "value": "Bearer {{token}}" }
+        ],
+        "body": { "mode": "raw", "raw": "{\n  \"decision\": \"APPROVE\"\n}" },
+        "url": "{{baseUrl}}/api/agent/runs/{{runId}}/approvals/{{proposalId}}",
+        "description": "Approves the pending proposal. The response should contain the successfully executed and verified task entity."
+      },
+      "event": [{
+        "listen": "test",
+        "script": {
+          "type": "text/javascript",
+          "exec": [
+            "pm.test('approval and execution succeeded', function () { pm.response.to.have.status(200); });",
+            "const body = pm.response.json();",
+            "const proposal = (body.actions || []).find(function (action) { return action.id === pm.collectionVariables.get('proposalId'); });",
+            "pm.test('run completed after approval', function () { pm.expect(body.success).to.eql(true); pm.expect(body.status).to.eql('completed'); });",
+            "pm.test('task mutation is verified', function () { pm.expect(proposal).to.exist; pm.expect(proposal.lifecycle).to.eql('VERIFIED'); pm.expect(proposal.result.success).to.eql(true); pm.expect(proposal.result.data.task.status).to.eql('OPEN'); pm.expect(proposal.result.data.task.title).to.eql('Postman smoke test task'); });"
+          ]
+        }
+      }]
+    },
+    {
+      "name": "4. Retrieve completed run",
+      "request": {
+        "method": "GET",
+        "header": [{ "key": "Authorization", "value": "Bearer {{token}}" }],
+        "url": "{{baseUrl}}/api/agent/runs/{{runId}}",
+        "description": "Reads the saved application-level run result, including its answer, evidence, action lifecycle, and trace."
+      },
+      "event": [{
+        "listen": "test",
+        "script": {
+          "type": "text/javascript",
+          "exec": [
+            "pm.test('run lookup succeeded', function () { pm.response.to.have.status(200); });",
+            "const body = pm.response.json();",
+            "pm.test('completed result is available', function () { pm.expect(body.success).to.eql(true); pm.expect(body.runId).to.eql(pm.collectionVariables.get('runId')); pm.expect(body.status).to.eql('completed'); pm.expect(body.answer).to.be.a('string').and.not.empty; });"
+          ]
+        }
+      }]
+    },
+    {
+      "name": "5. Retrieve run trace",
+      "request": {
+        "method": "GET",
+        "header": [{ "key": "Authorization", "value": "Bearer {{token}}" }],
+        "url": "{{baseUrl}}/api/runs/{{runId}}/trace",
+        "description": "Checks structured observability events for this run, including task proposal, approval, tool execution, verification, and run completion."
+      },
+      "event": [{
+        "listen": "test",
+        "script": {
+          "type": "text/javascript",
+          "exec": [
+            "pm.test('trace lookup succeeded', function () { pm.response.to.have.status(200); });",
+            "const body = pm.response.json();",
+            "const types = (body.trace && body.trace.events || []).map(function (event) { return event.eventType; });",
+            "pm.test('trace records completed action lifecycle', function () { pm.expect(body.success).to.eql(true); pm.expect(body.trace.status).to.eql('COMPLETED'); pm.expect(types).to.include('ACTION_PROPOSED'); pm.expect(types).to.include('ACTION_APPROVED'); pm.expect(types).to.include('ACTION_EXECUTED'); pm.expect(types).to.include('ACTION_VERIFIED'); pm.expect(types).to.include('AGENT_COMPLETED'); });"
+          ]
+        }
+      }]
+    }
+  ]
+}

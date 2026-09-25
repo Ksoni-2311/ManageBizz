@@ -1,0 +1,17 @@
+{
+  "name": "nexusops-root",
+  "private": true,
+  "version": "1.0.0",
+  "description": "NexusOps - Agentic Business Operations Platform",
+  "scripts": {
+    "build": "pnpm --filter \"./packages/*\" --filter \"./apps/*\" build",
+    "dev:api": "pnpm --filter @nexusops/api dev",
+    "dev:web": "pnpm --filter @nexusops/web dev",
+    "dev": "pnpm --parallel --filter @nexusops/api --filter @nexusops/web dev",
+    "typecheck": "pnpm -r typecheck",
+    "test": "pnpm --filter @nexusops/api test"
+  },
+  "devDependencies": {
+    "typescript": "^5.4.5"
+  }
+}
