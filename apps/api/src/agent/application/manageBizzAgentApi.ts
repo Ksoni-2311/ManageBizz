@@ -5,7 +5,7 @@ import { buildEvidenceReport, ToolObservation } from "../policies/dataIntegrity.
 import { ApprovalActionWorkflow, ActionProposal } from "../runtime/approvalWorkflow.js";
 import { ControlledAgentOrchestrator, PlannedToolCall, planBusinessGoal } from "../runtime/controlledOrchestrator.js";
 import { RunTraceRecord, RunTraceStore, runTraceStore } from "../runtime/runTrace.js";
-import { MockLLMProvider } from "../llm/unifiedLLM.js";
+import { getLLMProvider } from "../llm/unifiedLLM.js";
 
 export type ManageBizzRunStatus = "running" | "awaiting_approval" | "completed" | "failed";
 export type ManageBizzRunResult = {
@@ -20,7 +20,10 @@ export type ManageBizzRunResult = {
 };
 type AgentEvidenceFact = ReturnType<typeof buildEvidenceReport>["FACT"][number];
 export type ManageBizzRunInput = { goal: string; orgId: string; userId: string };
-type GoalParser = { parseGoal(goal: string): Promise<ParsedGoal> };
+type GoalParser = {
+  parseGoal(goal: string): Promise<ParsedGoal>;
+  generateResponse?(goal: string, observations: readonly ToolObservation[], evidenceReport: string): Promise<string>;
+};
 type Session = {
   orgId: string;
   userId: string;
@@ -28,6 +31,8 @@ type Session = {
   observations: ToolObservation[];
   completion: Promise<ManageBizzRunResult>;
   proposalReady: Promise<ActionProposal>;
+  proposalCount: number;
+  proposalWaiters: Array<{ after: number; resolve: () => void }>;
   resolveProposal: (proposal: ActionProposal) => void;
   finalResult?: ManageBizzRunResult;
 };
@@ -40,7 +45,7 @@ export class ManageBizzAgentApi {
   constructor(
     private readonly executeTool: ApplicationToolExecutor = (call, context) =>
       ToolOrchestrator.executeToolCall(call.tool, call.action, call.params, context),
-    private readonly parser: GoalParser = new MockLLMProvider(),
+    private readonly parser: GoalParser = getLLMProvider(),
     private readonly traces: RunTraceStore = runTraceStore
   ) {}
 
@@ -53,13 +58,24 @@ export class ManageBizzAgentApi {
     let resolveProposal!: (proposal: ActionProposal) => void;
     const proposalReady = new Promise<ActionProposal>((resolve) => { resolveProposal = resolve; });
     const observations: ToolObservation[] = [];
+    let sessionRef: Session | undefined;
     const workflow = new ApprovalActionWorkflow({ onUpdate: async (proposal) => {
       this.traceActionLifecycle(runId, proposal);
-      if (proposal.lifecycle === "PROPOSED") resolveProposal(proposal);
+      if (proposal.lifecycle === "PROPOSED") {
+        resolveProposal(proposal);
+        if (sessionRef) {
+          sessionRef.proposalCount += 1;
+          for (const waiter of sessionRef.proposalWaiters.splice(0)) {
+            if (sessionRef.proposalCount > waiter.after) waiter.resolve();
+            else sessionRef.proposalWaiters.push(waiter);
+          }
+        }
+      }
     } });
 
     const session = {} as Session;
-    Object.assign(session, { orgId, userId, workflow, observations, proposalReady, resolveProposal });
+    Object.assign(session, { orgId, userId, workflow, observations, proposalReady, resolveProposal, proposalCount: 0, proposalWaiters: [] });
+    sessionRef = session;
     this.sessions.set(runId, session);
 
     const complete = async (): Promise<ManageBizzRunResult> => {
@@ -76,7 +92,10 @@ export class ManageBizzAgentApi {
           return result;
         });
         const run = await orchestrator.run(parsedGoal, { runId, goalId, orgId, userId }, plan);
-        const result = this.buildResult(runId, orgId, run.status, run.finalText, observations, workflow.list(),
+        const answer = run.status === "completed" && this.parser.generateResponse
+          ? await this.parser.generateResponse(goal, observations, run.finalText)
+          : run.finalText;
+        const result = this.buildResult(runId, orgId, run.status, answer, observations, workflow.list(),
           run.status === "failed" ? this.failureFor(run.error, observations) : undefined);
         this.traces.finishRun(runId, result.status === "completed" ? "COMPLETED" : "FAILED", result.error?.message);
         session.finalResult = this.withTrace(result);
@@ -122,15 +141,21 @@ export class ManageBizzAgentApi {
   ): Promise<ManageBizzRunResult | undefined> {
     const session = this.sessions.get(runId);
     if (!session || session.orgId !== orgId || session.userId !== userId) return undefined;
+    const priorProposalCount = session.proposalCount;
     const accepted = await session.workflow.decide(proposalId, decision, decidedById, feedback);
     if (!accepted) return undefined;
-    return session.completion;
+    const next = await Promise.race([
+      session.completion.then((result) => ({ kind: "complete" as const, result })),
+      waitForProposalAfter(session, priorProposalCount).then(() => ({ kind: "proposal" as const }))
+    ]);
+    if (next.kind === "complete") return next.result;
+    return this.buildResult(runId, orgId, "awaiting_approval", "The previous action was processed. The next proposed action is awaiting approval.", session.observations, session.workflow.list());
   }
 
   private async executePlannedCall(call: PlannedToolCall, context: ToolExecutionContext, workflow: ApprovalActionWorkflow): Promise<ToolResponse> {
-    const execute = () => this.traces.traceToolCall({
+    const execute = (executionContext: ToolExecutionContext = context) => this.traces.traceToolCall({
       runId: context.runId, toolName: call.tool, action: call.action, input: call.params,
-      execute: () => this.executeTool(call, context)
+      execute: () => this.executeTool(call, executionContext)
     });
     return ACTION_TOOL_ACTIONS[call.tool]?.includes(call.action)
       ? workflow.proposeExecuteVerify(call, context, execute)
@@ -195,6 +220,11 @@ export class ManageBizzAgentApi {
   private withTrace(result: ManageBizzRunResult): ManageBizzRunResult {
     return { ...result, trace: this.traces.getRunTrace(result.runId, result.trace.orgId) ?? result.trace };
   }
+}
+
+function waitForProposalAfter(session: Session, previousCount: number): Promise<void> {
+  if (session.proposalCount > previousCount) return Promise.resolve();
+  return new Promise((resolve) => session.proposalWaiters.push({ after: previousCount, resolve }));
 }
 
 export const manageBizzAgentApi = new ManageBizzAgentApi();

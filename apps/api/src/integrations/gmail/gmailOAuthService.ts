@@ -3,7 +3,7 @@ import { EmailConnectionRepository, emailConnectionRepository } from "./emailCon
 import { assertGoogleTokenEncryptionKey, encryptGoogleRefreshToken, decryptGoogleRefreshToken } from "../googleOAuth/tokenEncryption.js";
 import { GoogleProviderError } from "../googleOAuth/googleProviderError.js";
 
-const SCOPE = "https://www.googleapis.com/auth/gmail.readonly";
+const SCOPES = ["https://www.googleapis.com/auth/gmail.readonly", "https://www.googleapis.com/auth/gmail.compose"];
 type Owner = { workspaceId: string; userId: string };
 type Pending = Owner & { verifier: string; createdAt: number };
 export class GmailOAuthService {
@@ -15,7 +15,7 @@ export class GmailOAuthService {
     const state = randomBytes(32).toString("base64url"), verifier = randomBytes(48).toString("base64url");
     const challenge = createHash("sha256").update(verifier).digest("base64url");
     this.expireStates(); this.states.set(state, { ...owner, verifier, createdAt: this.now() });
-    return `https://accounts.google.com/o/oauth2/v2/auth?${new URLSearchParams({ client_id: clientId, redirect_uri: redirectUri, response_type: "code", scope: SCOPE, access_type: "offline", include_granted_scopes: "true", prompt: "consent", state, code_challenge: challenge, code_challenge_method: "S256" })}`;
+    return `https://accounts.google.com/o/oauth2/v2/auth?${new URLSearchParams({ client_id: clientId, redirect_uri: redirectUri, response_type: "code", scope: SCOPES.join(" "), access_type: "offline", include_granted_scopes: "true", prompt: "consent", state, code_challenge: challenge, code_challenge_method: "S256" })}`;
   }
   async complete(code: string, state: string): Promise<Owner> {
     this.expireStates(); const pending = this.states.get(state); this.states.delete(state);

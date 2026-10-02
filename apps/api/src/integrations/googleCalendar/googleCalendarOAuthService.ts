@@ -5,7 +5,7 @@ import { assertCalendarEncryptionKey, decryptRefreshToken, encryptRefreshToken }
 const GOOGLE_AUTH = "https://accounts.google.com/o/oauth2/v2/auth";
 const GOOGLE_TOKEN = "https://oauth2.googleapis.com/token";
 const GOOGLE_REVOKE = "https://oauth2.googleapis.com/revoke";
-const CALENDAR_SCOPE = "https://www.googleapis.com/auth/calendar.events.readonly";
+const CALENDAR_SCOPE = "https://www.googleapis.com/auth/calendar.events";
 type Owner = { workspaceId: string; userId: string };
 type OAuthState = Owner & { createdAt: number; verifier: string };
 

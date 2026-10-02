@@ -1,4 +1,4 @@
-import { CalendarEvent, CalendarIdentity, CalendarListQuery, CalendarProvider, CalendarProviderError } from "../integrations/googleCalendar/calendarProvider.js";
+import { CalendarEvent, CalendarEventInput, CalendarIdentity, CalendarListQuery, CalendarProvider, CalendarProviderError } from "../integrations/googleCalendar/calendarProvider.js";
 
 export class CalendarService {
   constructor(private readonly provider: CalendarProvider) {}
@@ -13,6 +13,9 @@ export class CalendarService {
   }
   connectionStatus(identity: CalendarIdentity): Promise<{ connected: boolean; reauthorizationRequired?: boolean }> {
     return this.run(() => this.provider.connectionStatus(identity));
+  }
+  createEvent(identity: CalendarIdentity, event: CalendarEventInput, actionId: string): Promise<CalendarEvent> {
+    return this.run(() => this.provider.createEvent(identity, event, actionId));
   }
   private async run<T>(operation: () => Promise<T>): Promise<T> {
     try { return await operation(); }

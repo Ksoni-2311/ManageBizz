@@ -82,6 +82,29 @@ describe("Google Calendar provider architecture", () => {
     });
   });
 
+  it("creates calendar events with Google and verifies the returned event resource", async () => {
+    await withEnv({ GOOGLE_CALENDAR_CLIENT_ID: "client", GOOGLE_CALENDAR_CLIENT_SECRET: "secret", CALENDAR_TOKEN_ENCRYPTION_KEY: key }, async () => {
+      const repository = new InMemoryCalendarConnectionRepository();
+      await repository.save({ ...identity, encryptedRefreshToken: encryptRefreshToken("refresh-token"), connectedAt: new Date().toISOString() });
+      const calls: Array<{ url: string; init?: RequestInit }> = [];
+      const fetcher: typeof fetch = async (input, init) => {
+        const url = String(input); calls.push({ url, ...(init ? { init } : {}) });
+        if (url.includes("oauth2.googleapis.com")) return new Response(JSON.stringify({ access_token: "access", expires_in: 3600 }), { status: 200 });
+        if (url.includes("/events?") && init?.method === "POST") return new Response(JSON.stringify({
+          id: "event-confirmed", summary: "Review", status: "confirmed", attendees: [{ email: "lead@example.test" }],
+          start: { dateTime: "2026-10-05T10:00:00.000Z" }, end: { dateTime: "2026-10-05T10:30:00.000Z" }
+        }), { status: 200 });
+        return new Response(JSON.stringify({ error: "unexpected request" }), { status: 500 });
+      };
+      const provider = new GoogleCalendarProvider(repository, fetcher);
+      const event = await provider.createEvent(identity, { title: "Review", attendees: ["lead@example.test"], startTime: "2026-10-05T10:00:00.000Z", endTime: "2026-10-05T10:30:00.000Z" }, "create-event");
+      assert.equal(event.id, "event-confirmed");
+      assert.equal(event.status, "SCHEDULED");
+      assert.equal(calls.find(({ url }) => url.includes("/events?"))?.init?.method, "POST");
+      assert.equal(new URL(calls.find(({ url }) => url.includes("/events?"))!.url).searchParams.get("sendUpdates"), "all");
+    });
+  });
+
   it("binds OAuth state to the requesting user, encrypts refresh tokens, and disconnects", async () => {
     await withEnv({
       GOOGLE_CALENDAR_CLIENT_ID: "client-id", GOOGLE_CALENDAR_CLIENT_SECRET: "client-secret",
@@ -97,7 +120,7 @@ describe("Google Calendar provider architecture", () => {
       const oauth = new GoogleCalendarOAuthService(repository, fetcher);
       const authorizationUrl = new URL(oauth.authorizationUrl(identity));
       assert.equal(authorizationUrl.searchParams.get("access_type"), "offline");
-      assert.equal(authorizationUrl.searchParams.get("scope"), "https://www.googleapis.com/auth/calendar.events.readonly");
+      assert.equal(authorizationUrl.searchParams.get("scope"), "https://www.googleapis.com/auth/calendar.events");
       assert.equal(authorizationUrl.searchParams.get("code_challenge_method"), "S256");
       const state = authorizationUrl.searchParams.get("state")!;
       await assert.rejects(oauth.complete("auth-code", "unknown-state"), /could not be verified/);
@@ -111,9 +134,18 @@ describe("Google Calendar provider architecture", () => {
     });
   });
 
-  it("keeps calendar writes disabled", async () => {
-    const result = await new CalendarToolService().createMeeting({}, context);
-    assert.equal(result.success, false);
-    if (!result.success) assert.equal(result.error.code, "READ_ONLY_CALENDAR");
+  it("creates events through the mock provider and validates event input", async () => {
+    const provider = new MockCalendarProvider();
+    const calendar = new CalendarToolService({ provider });
+    const input = { title: "Planning review", attendees: ["lead@example.test"], startTime: "2026-10-03T10:00:00.000Z", endTime: "2026-10-03T10:30:00.000Z" };
+    const created = await calendar.createMeeting(input, { ...context, actionId: "create-event", approvedActionId: "create-event" });
+    assert.equal(created.success, true);
+    if (created.success) {
+      const details = await calendar.getMeeting({ meetingId: created.data.id }, context);
+      assert.equal(details.success, true);
+    }
+    const invalid = await calendar.createMeeting({ ...input, endTime: input.startTime }, { ...context, actionId: "invalid-event", approvedActionId: "invalid-event" });
+    assert.equal(invalid.success, false);
+    if (!invalid.success) assert.equal(invalid.error.code, "INVALID_INPUT");
   });
 });

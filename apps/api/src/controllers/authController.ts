@@ -5,6 +5,7 @@ import { z } from "zod";
 import { AuthenticatedRequest, signSession } from "../middleware/auth.js";
 import { UserModel } from "../models/User.js";
 import { workspaceIdFor } from "../domain/businessData.js";
+import { config } from "../config/index.js";
 
 const registerSchema = z.object({
   name: z.string().trim().min(1).max(100).optional(),
@@ -62,6 +63,16 @@ export const logout = async (req: AuthenticatedRequest, res: Response): Promise<
 
 export const getMe = async (req: AuthenticatedRequest, res: Response): Promise<void> => {
   if (!req.user) { res.status(401).json({ success: false, error: { code: "AUTH_REQUIRED", message: "Sign in is required." } }); return; }
+  if (config.mvpMode) {
+    res.json({ success: true, user: {
+      id: req.user.userId,
+      name: "MVP Development User",
+      email: req.user.email,
+      role: req.user.role,
+      workspaceId: workspaceIdFor(req.user.orgId, req.user.userId)
+    } });
+    return;
+  }
   try {
     const user = await UserModel.findById(req.user.userId);
     if (!user || user.orgId !== req.user.orgId) { res.status(401).json({ success: false, error: { code: "SESSION_REVOKED", message: "This account session is no longer valid." } }); return; }

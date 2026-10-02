@@ -5,15 +5,22 @@ import { GoogleProviderError } from "../googleOAuth/googleProviderError.js";
 export type EmailIdentity = { workspaceId: string; userId: string };
 export type ProviderEmail = { id: string; threadId?: string | undefined; leadEmail?: string | undefined; direction: "INBOUND" | "OUTBOUND"; subject?: string | undefined; sentAt?: string | undefined; inReplyToMessageId?: string | undefined; messageId?: string | undefined };
 export type EmailSearch = { leadEmail?: string | undefined; leadEmails?: string[] | undefined; query?: string | undefined };
+export type EmailDraftInput = { to: string; subject: string; body: string };
+export type ProviderEmailDraft = EmailDraftInput & { draftId: string; status: "DRAFT" };
+export type ProviderSentEmail = { messageId: string; draftId: string; to: string; subject: string; sentAt: string; status: "SENT" };
 export interface EmailProvider {
   search(identity: EmailIdentity, query: EmailSearch): Promise<ProviderEmail[]>;
   getMetadata(identity: EmailIdentity, messageId: string): Promise<ProviderEmail | undefined>;
   connectionStatus(identity: EmailIdentity): Promise<{ connected: boolean; reauthorizationRequired?: boolean }>;
+  createDraft(identity: EmailIdentity, draft: EmailDraftInput, actionId: string): Promise<ProviderEmailDraft>;
+  sendDraft(identity: EmailIdentity, draftId: string, actionId: string): Promise<ProviderSentEmail>;
 }
 
 /** Explicit fake provider for deterministic tests; the production singleton never uses it. */
 export class MockEmailProvider implements EmailProvider {
   private values = new Map<string, ProviderEmail[]>();
+  private drafts = new Map<string, ProviderEmailDraft>();
+  private sentActions = new Map<string, ProviderSentEmail>();
   seed(identity: EmailIdentity, messages: ProviderEmail[]) { this.values.set(key(identity), messages.map((message) => ({ ...message }))); }
   async search(identity: EmailIdentity, query: EmailSearch) {
     const values = this.values.get(key(identity)) ?? this.values.get("*\0*") ?? [];
@@ -22,10 +29,31 @@ export class MockEmailProvider implements EmailProvider {
   }
   async getMetadata(identity: EmailIdentity, id: string) { const value = (this.values.get(key(identity)) ?? this.values.get("*\0*") ?? []).find((message) => message.id === id); return value ? { ...value } : undefined; }
   async connectionStatus(identity: EmailIdentity) { return { connected: this.values.has(key(identity)) }; }
+  async createDraft(identity: EmailIdentity, draft: EmailDraftInput, actionId: string): Promise<ProviderEmailDraft> {
+    const idempotencyKey = `${key(identity)}\0${actionId}`;
+    const existing = this.drafts.get(idempotencyKey);
+    if (existing) return { ...existing };
+    const value: ProviderEmailDraft = { ...draft, draftId: `mock-draft-${actionId}`, status: "DRAFT" };
+    this.drafts.set(idempotencyKey, value);
+    this.drafts.set(`${key(identity)}\0draft-id\0${value.draftId}`, value);
+    return { ...value };
+  }
+  async sendDraft(identity: EmailIdentity, draftId: string, actionId: string): Promise<ProviderSentEmail> {
+    const idempotencyKey = `${key(identity)}\0${actionId}`;
+    const previous = this.sentActions.get(idempotencyKey);
+    if (previous) return { ...previous };
+    const draft = this.drafts.get(`${key(identity)}\0draft-id\0${draftId}`);
+    if (!draft) throw new GoogleProviderError("EMAIL_DRAFT_NOT_FOUND", "The requested Gmail draft was not found in this account.", 404);
+    const sent: ProviderSentEmail = { messageId: `mock-message-${actionId}`, draftId, to: draft.to, subject: draft.subject, sentAt: new Date().toISOString(), status: "SENT" };
+    this.sentActions.set(idempotencyKey, sent);
+    this.values.set(key(identity), [...(this.values.get(key(identity)) ?? []), { id: sent.messageId, leadEmail: sent.to, direction: "OUTBOUND", subject: sent.subject, sentAt: sent.sentAt }]);
+    return { ...sent };
+  }
 }
 
 type GmailMessage = { id?: string; threadId?: string; labelIds?: string[]; internalDate?: string; payload?: { headers?: Array<{ name?: string; value?: string }> } };
 type GmailThread = { messages?: GmailMessage[] };
+type GmailDraftResource = { id?: string; message?: GmailMessage };
 const headersToGet = ["From", "To", "Cc", "Subject", "Date", "In-Reply-To", "References", "Message-ID"];
 
 /** Uses metadata format only; message bodies are never requested. */
@@ -80,6 +108,66 @@ export class GmailProvider implements EmailProvider {
     const date = message.internalDate ? new Date(Number(message.internalDate)).toISOString() : validDate(h.get("date"));
     return { id: message.id, ...(message.threadId ? { threadId: message.threadId } : {}), ...(contact ? { leadEmail: contact } : {}), direction: sent ? "OUTBOUND" : "INBOUND", ...(h.get("subject") ? { subject: h.get("subject") } : {}), ...(date ? { sentAt: date } : {}) };
   }
+  async createDraft(identity: EmailIdentity, draft: EmailDraftInput, _actionId: string): Promise<ProviderEmailDraft> {
+    const token = await this.accessToken(identity);
+    const raw = encodeMimeMessage(draft);
+    let response: Response;
+    try {
+      response = await this.request("https://gmail.googleapis.com/gmail/v1/users/me/drafts", {
+        method: "POST", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+        body: JSON.stringify({ message: { raw } })
+      });
+    } catch { throw new GoogleProviderError("EMAIL_UNAVAILABLE", "Gmail draft creation could not reach Google.", 503); }
+    if (!response.ok) throw await this.apiError(identity, response);
+    const result = await response.json() as GmailDraftResource;
+    if (!result.id) throw new GoogleProviderError("EMAIL_DRAFT_UNVERIFIED", "Gmail did not return a draft ID; draft creation could not be verified.", 502);
+    const verifyResponse = await this.request(`https://gmail.googleapis.com/gmail/v1/users/me/drafts/${encodeURIComponent(result.id)}?${metadataParams()}`, { headers: { Authorization: `Bearer ${token}` } });
+    if (!verifyResponse.ok) throw new GoogleProviderError("EMAIL_DRAFT_VERIFICATION_FAILED", "Gmail created a draft but its recipient and subject could not be verified.", 502);
+    const verified = await verifyResponse.json() as GmailDraftResource;
+    const headers = headerMap(verified.message ?? {});
+    const verifiedTo = addresses(headers.get("to"))[0];
+    if (verified.id !== result.id || !verified.message?.id || !(verified.message.labelIds ?? []).includes("DRAFT") || verifiedTo !== draft.to.toLowerCase() || headers.get("subject") !== draft.subject) {
+      throw new GoogleProviderError("EMAIL_DRAFT_VERIFICATION_FAILED", "The returned Gmail draft did not verify the requested recipient and subject.", 502);
+    }
+    return { ...draft, to: verifiedTo, subject: headers.get("subject")!, draftId: result.id, status: "DRAFT" };
+  }
+  async sendDraft(identity: EmailIdentity, draftId: string, _actionId: string): Promise<ProviderSentEmail> {
+    const token = await this.accessToken(identity);
+    const draftResponse = await this.request(`https://gmail.googleapis.com/gmail/v1/users/me/drafts/${encodeURIComponent(draftId)}?${metadataParams()}`, { headers: { Authorization: `Bearer ${token}` } });
+    if (draftResponse.status === 404) throw new GoogleProviderError("EMAIL_DRAFT_NOT_FOUND", "The requested Gmail draft was not found in this account.", 404);
+    if (!draftResponse.ok) throw await this.apiError(identity, draftResponse);
+    const existingDraft = await draftResponse.json() as GmailDraftResource;
+    if (!existingDraft.id || !existingDraft.message?.id) throw new GoogleProviderError("EMAIL_DRAFT_UNVERIFIED", "The Gmail draft could not be verified before sending.", 502);
+    const draftHeaders = headerMap(existingDraft.message);
+    const to = addresses(draftHeaders.get("to"))[0];
+    const subject = draftHeaders.get("subject");
+    if (!to || !subject) throw new GoogleProviderError("EMAIL_DRAFT_INVALID", "The Gmail draft is missing a verifiable recipient or subject.", 422);
+
+    const sendResponse = await this.request("https://gmail.googleapis.com/gmail/v1/users/me/drafts/send", {
+      method: "POST", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" }, body: JSON.stringify({ id: draftId })
+    });
+    if (!sendResponse.ok) throw await this.apiError(identity, sendResponse);
+    const sent = await sendResponse.json() as GmailMessage;
+    if (!sent.id) throw new GoogleProviderError("EMAIL_SEND_UNVERIFIED", "Gmail accepted the send request without returning a message ID.", 502);
+
+    const verificationQuery = new URLSearchParams({ format: "metadata" });
+    verificationQuery.append("metadataHeaders", "To");
+    verificationQuery.append("metadataHeaders", "Subject");
+    const verifyResponse = await this.request(`https://gmail.googleapis.com/gmail/v1/users/me/messages/${encodeURIComponent(sent.id)}?${verificationQuery}`, { headers: { Authorization: `Bearer ${token}` } });
+    if (!verifyResponse.ok) throw new GoogleProviderError("EMAIL_SEND_VERIFICATION_FAILED", "Gmail accepted the send request, but the sent message could not be verified.", 502);
+    const verifiedMessage = await verifyResponse.json() as GmailMessage;
+    const verifiedHeaders = headerMap(verifiedMessage);
+    const verifiedTo = addresses(verifiedHeaders.get("to"))[0];
+    const verifiedSubject = verifiedHeaders.get("subject");
+    if (verifiedMessage.id !== sent.id || verifiedTo !== to || verifiedSubject !== subject || !(verifiedMessage.labelIds ?? []).includes("SENT")) {
+      throw new GoogleProviderError("EMAIL_SEND_VERIFICATION_FAILED", "The returned Gmail message did not verify the requested recipient, subject, and sent status.", 502);
+    }
+    const sentAt = verifiedMessage.internalDate ? new Date(Number(verifiedMessage.internalDate)).toISOString() : undefined;
+    if (!sentAt || !Number.isFinite(Date.parse(sentAt))) {
+      throw new GoogleProviderError("EMAIL_SEND_VERIFICATION_FAILED", "Gmail returned no verifiable sent timestamp; the send outcome could not be fully verified.", 502);
+    }
+    return { messageId: sent.id, draftId, to, subject, sentAt, status: "SENT" };
+  }
   private async accessToken(identity: EmailIdentity): Promise<string> {
     const id = key(identity), connection = await this.repository.get(identity.workspaceId, identity.userId);
     if (!connection) throw new GoogleProviderError("EMAIL_NOT_CONNECTED", "Gmail is not connected for this workspace.", 409);
@@ -120,3 +208,8 @@ function headerMap(message: GmailMessage) { return new Map((message.payload?.hea
 function addresses(value?: string) { return value?.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi)?.map((email) => email.toLowerCase()) ?? []; }
 function validDate(value?: string) { return value && Number.isFinite(Date.parse(value)) ? new Date(value).toISOString() : undefined; }
 function key(identity: EmailIdentity) { return `${identity.workspaceId}\0${identity.userId}`; }
+function encodeMimeMessage(draft: EmailDraftInput): string {
+  const safeSubject = draft.subject.replace(/[\r\n]/g, " ");
+  const mime = `To: ${draft.to}\r\nSubject: ${safeSubject}\r\nMIME-Version: 1.0\r\nContent-Type: text/plain; charset=UTF-8\r\nContent-Transfer-Encoding: base64\r\n\r\n${Buffer.from(draft.body, "utf8").toString("base64")}`;
+  return Buffer.from(mime, "utf8").toString("base64url");
+}

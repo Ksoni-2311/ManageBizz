@@ -44,17 +44,26 @@ export type ToolObservation = {
 };
 
 /** Returns a user-facing claim only when the action result confirms its mutation. */
-export function verifiedActionStatement(tool: string, action: string, result: ToolResponse): string | undefined {
-  if (tool !== "tasks" || (action !== "createTask" && action !== "completeTask") || !result.success) return undefined;
+export function verifiedActionStatement(tool: string, action: string, result: ToolResponse, params: Record<string, unknown> = {}): string | undefined {
+  if (!result.success) return undefined;
   if (typeof result.data !== "object" || result.data === null) return undefined;
   const data = result.data as Record<string, unknown>;
-  if (typeof data.task !== "object" || data.task === null) return undefined;
-  const task = data.task as Record<string, unknown>;
-  if (action === "createTask" && data.created === true && typeof task.id === "string" && typeof task.title === "string" && task.status === "OPEN") {
-    return `Created task "${task.title}" (id: ${task.id}).`;
+  if (tool === "tasks" && (action === "createTask" || action === "completeTask")) {
+    if (typeof data.task !== "object" || data.task === null) return undefined;
+    const task = data.task as Record<string, unknown>;
+    if (action === "createTask" && data.created === true && typeof task.id === "string" && typeof task.title === "string" && task.status === "OPEN" && task.title === params.title) return `Created task "${task.title}" (id: ${task.id}).`;
+    if (action === "completeTask" && data.updated === true && typeof task.id === "string" && task.status === "COMPLETED" && task.id === params.taskId) return `Completed task ${task.id}.`;
   }
-  if (action === "completeTask" && data.updated === true && typeof task.id === "string" && task.status === "COMPLETED") {
-    return `Completed task ${task.id}.`;
+  if (tool === "email" && action === "draftEmail" && typeof data.draftId === "string" && data.draftId && typeof data.to === "string" && data.to.toLowerCase() === String(params.to ?? "").toLowerCase() && typeof data.subject === "string" && data.subject === params.subject && data.status === "DRAFT") {
+    return `Created Gmail draft "${data.subject}" for ${data.to} (draft id: ${data.draftId}).`;
+  }
+  if (tool === "email" && action === "sendEmail" && typeof data.messageId === "string" && data.messageId && data.draftId === params.draftId && typeof data.to === "string" && typeof data.subject === "string" && data.status === "SENT" && typeof data.sentAt === "string" && Number.isFinite(Date.parse(data.sentAt))) {
+    return `Sent Gmail message "${data.subject}" to ${data.to} (message id: ${data.messageId}).`;
+  }
+  const returnedAttendees = Array.isArray(data.attendees) ? data.attendees.map(String).map((email) => email.toLowerCase()).sort() : [];
+  const requestedAttendees = Array.isArray(params.attendees) ? params.attendees.map(String).map((email) => email.toLowerCase()).sort() : [];
+  if (tool === "calendar" && action === "createMeeting" && typeof data.id === "string" && data.id && typeof data.title === "string" && data.title === params.title && data.status === "SCHEDULED" && typeof data.startTime === "string" && Date.parse(data.startTime) === Date.parse(String(params.startTime)) && typeof data.endTime === "string" && Date.parse(data.endTime) === Date.parse(String(params.endTime)) && JSON.stringify(returnedAttendees) === JSON.stringify(requestedAttendees)) {
+    return `Created calendar event "${data.title}" (id: ${data.id}).`;
   }
   return undefined;
 }
@@ -79,7 +88,7 @@ function emptyResultStatement(tool: string, action: string, params: Record<strin
 export function buildEvidenceReport(observations: readonly ToolObservation[]): AgentEvidenceReport {
   const facts: EvidenceItem[] = observations.map(({ tool, action, params, result }, index) => {
     const evidenceRef = `${tool}.${action}#${index + 1}`;
-    const actionStatement = verifiedActionStatement(tool, action, result);
+    const actionStatement = verifiedActionStatement(tool, action, result, params);
     if (actionStatement) return { evidenceRef, tool, action, statement: actionStatement, outcome: "RESULT_RETURNED" };
     if (!result.success) {
       return {
@@ -90,8 +99,10 @@ export function buildEvidenceReport(observations: readonly ToolObservation[]): A
         error: { ...result.error }
       };
     }
-    if (tool === "tasks" && (action === "createTask" || action === "completeTask")) {
-      return { evidenceRef, tool, action, statement: "The task mutation was not confirmed by the returned task entity.", outcome: "SUCCESS_NOT_CONFIRMED" };
+    if ((tool === "tasks" && (action === "createTask" || action === "completeTask")) ||
+      (tool === "email" && (action === "draftEmail" || action === "sendEmail")) ||
+      (tool === "calendar" && action === "createMeeting")) {
+      return { evidenceRef, tool, action, statement: `The ${tool} mutation was not confirmed by its returned entity.`, outcome: "SUCCESS_NOT_CONFIRMED" };
     }
     if (Array.isArray(result.data) && result.data.length === 0) {
       return { evidenceRef, tool, action, statement: emptyResultStatement(tool, action, params), outcome: "EMPTY_RESULT" };

@@ -15,6 +15,15 @@ export type UserLookup = (userId: string) => Promise<AuthUser | null>;
 
 export function createAuthenticateToken(findUser: UserLookup = (userId) => UserModel.findById(userId).select("_id email role orgId sessionVersion").lean() as Promise<AuthUser | null>) {
   return async function authenticateToken(req: AuthenticatedRequest, res: Response, next: NextFunction): Promise<void> {
+  if (config.mvpMode) {
+    const userId = "mvp-dev-user";
+    const organizationId = "mvp-dev-org";
+    req.user = { userId, email: "mvp-dev-user@local.invalid", role: UserRole.MEMBER, orgId: organizationId };
+    req.businessOwner = { userId, organizationId, workspaceId: workspaceIdFor(organizationId, userId) };
+    next();
+    return;
+  }
+
   const authHeader = req.headers["authorization"];
   const token = authHeader?.startsWith("Bearer ") ? authHeader.slice(7).trim() : "";
   if (!token) { res.status(401).json({ success: false, error: { code: "AUTH_REQUIRED", message: "A valid bearer session is required." } }); return; }

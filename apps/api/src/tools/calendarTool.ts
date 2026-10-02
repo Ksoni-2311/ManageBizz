@@ -2,7 +2,7 @@ import { ToolExecutionContext, ToolResponse } from "@nexusops/shared-types";
 import { z } from "zod";
 import { CalendarService } from "../services/calendarService.js";
 import { CalendarProvider, CalendarEvent, GoogleCalendarProvider, MockCalendarProvider } from "../integrations/googleCalendar/calendarProvider.js";
-import { emailAddress, nonEmpty, runValidated, ToolDomainError } from "./contract.js";
+import { emailAddress, nonEmpty, requireApprovedAction, runValidated, ToolDomainError } from "./contract.js";
 
 const availabilitySchema = z.object({
   date: z.string().datetime().optional(), durationMinutes: z.number().int().positive().optional(),
@@ -12,6 +12,15 @@ const meetingLookupSchema = z.object({ meetingId: nonEmpty }).strict();
 const leadLookupSchema = z.object({ leadEmail: emailAddress }).strict();
 const upcomingSchema = z.object({ from: z.string().datetime().optional(), until: z.string().datetime().optional() }).strict()
   .refine(({ from, until }) => !from || !until || Date.parse(until) > Date.parse(from), { path: ["until"], message: "until must be later than from" });
+const createMeetingSchema = z.object({
+  title: nonEmpty.max(300),
+  startTime: z.string().datetime(),
+  endTime: z.string().datetime(),
+  attendees: z.array(emailAddress).max(100).default([]),
+  description: z.string().max(10_000).optional(),
+  location: z.string().trim().max(500).optional()
+}).strict().refine(({ startTime, endTime }) => Date.parse(endTime) > Date.parse(startTime), { path: ["endTime"], message: "endTime must be after startTime" })
+  .refine(({ attendees }) => new Set(attendees.map((email) => email.toLowerCase())).size === attendees.length, { path: ["attendees"], message: "attendees must be unique" });
 const readOnlyActionSchema = z.object({}).passthrough();
 export type Meeting = CalendarEvent;
 export type CalendarToolOptions = { clock?: () => Date; provider?: CalendarProvider };
@@ -64,9 +73,8 @@ export class CalendarToolService {
     return this.service.connectionStatus(identity(context));
   }
 
-  /** Calendar changes remain disabled until a separately verified write integration is implemented. */
-  createMeeting(params: unknown, context: ToolExecutionContext): Promise<ToolResponse<never>> {
-    return runValidated(readOnlyActionSchema, params, context, () => { throw new ToolDomainError("READ_ONLY_CALENDAR", "Calendar event creation is disabled."); });
+  createMeeting(params: unknown, context: ToolExecutionContext): Promise<ToolResponse<Meeting>> {
+    return runValidated(createMeetingSchema, params, context, (event) => { requireApprovedAction(context); return this.calendarCall(() => this.service.createEvent(identity(context), { ...event, attendees: event.attendees ?? [] }, context.actionId)); });
   }
   cancelMeeting(params: unknown, context: ToolExecutionContext): Promise<ToolResponse<never>> {
     return runValidated(readOnlyActionSchema, params, context, () => { throw new ToolDomainError("READ_ONLY_CALENDAR", "Calendar event cancellation is disabled."); });

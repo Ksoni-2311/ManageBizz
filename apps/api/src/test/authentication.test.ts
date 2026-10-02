@@ -2,11 +2,11 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { Response } from "express";
 import { UserRole } from "@nexusops/shared-types";
-import { config } from "../config/index.js";
+import { assertMvpModeAllowed, config } from "../config/index.js";
 import { AuthenticatedRequest, authenticateToken, createAuthenticateToken, signSession } from "../middleware/auth.js";
 import { resolveWorkspaceScope } from "../middleware/workspace.js";
 import { workspaceIdFor } from "../domain/businessData.js";
-import { register } from "../controllers/authController.js";
+import { getMe, register } from "../controllers/authController.js";
 
 function responseMock() {
   const state: { statusCode?: number; body?: unknown } = {};
@@ -33,6 +33,30 @@ describe("authenticated identity and workspace boundaries", () => {
     await authenticateToken(invalid, invalidResponse.response, () => { continued = true; });
     assert.equal(invalidResponse.state.statusCode, 401);
     assert.equal(invalid.user, undefined);
+  });
+
+  it("allows a fixed development-only MVP identity without creating business records", async () => {
+    const priorMode = config.mvpMode;
+    try {
+      assert.throws(() => assertMvpModeAllowed("production", true), /not allowed/);
+      assert.doesNotThrow(() => assertMvpModeAllowed("development", true));
+      config.mvpMode = true;
+      const request = { headers: {} } as AuthenticatedRequest;
+      const response = responseMock();
+      let continued = false;
+      await authenticateToken(request, response.response, () => { continued = true; });
+      assert.equal(continued, true);
+      assert.equal(request.user?.userId, "mvp-dev-user");
+      assert.equal(request.businessOwner?.workspaceId, workspaceIdFor("mvp-dev-org", "mvp-dev-user"));
+      const meResponse = responseMock();
+      await getMe(request, meResponse.response);
+      const currentUser = (meResponse.state.body as { user?: { id: string; workspaceId: string; name: string } }).user;
+      assert.equal(currentUser?.id, "mvp-dev-user");
+      assert.equal(currentUser?.workspaceId, workspaceIdFor("mvp-dev-org", "mvp-dev-user"));
+      assert.equal(currentUser?.name, "MVP Development User");
+    } finally {
+      config.mvpMode = priorMode;
+    }
   });
 
   it("derives identity from the signed session and ignores browser owner/workspace values", async () => {

@@ -51,10 +51,12 @@ function isEmptyEvidence(fact: AgentRun["evidence"]["facts"][number]): boolean {
 
 function ActionCard({
   action,
+  relatedDraft,
   busy,
   onDecision
 }: {
   action: ActionProposal;
+  relatedDraft?: { to?: string; subject?: string; body?: string };
   busy: boolean;
   onDecision: (action: ActionProposal, decision: "APPROVE" | "REJECT") => void;
 }) {
@@ -73,7 +75,11 @@ function ActionCard({
         </div>
         <StatusPill status={action.lifecycle} />
       </div>
+      <StatusPill status={`RISK_${action.riskLevel ?? "UNKNOWN"}`} />
       {action.action === "createTask" && typeof action.params.title === "string" && <p className="muted">Task title: {action.params.title}</p>}
+      {action.action === "draftEmail" && <div className="action-preview"><strong>To:</strong> {String(action.params.to ?? "Unavailable")}<br /><strong>Subject:</strong> {String(action.params.subject ?? "Unavailable")}<pre>{String(action.params.body ?? "No draft body supplied.")}</pre></div>}
+      {action.action === "sendEmail" && <div className="action-preview"><strong>Draft to send:</strong> {relatedDraft?.to ?? "Recipient unavailable"}<br /><strong>Subject:</strong> {relatedDraft?.subject ?? "Subject unavailable"}<p>{relatedDraft?.body ?? `Draft ID: ${String(action.params.draftId ?? "Unavailable")}`}</p><small>Gmail will send this existing draft only after approval.</small></div>}
+      {action.action === "createMeeting" && <div className="action-preview"><strong>Event:</strong> {String(action.params.title ?? "Unavailable")}<br /><strong>Start:</strong> {String(action.params.startTime ?? "Unavailable")}<br /><strong>End:</strong> {String(action.params.endTime ?? "Unavailable")}<br /><strong>Attendees:</strong> {Array.isArray(action.params.attendees) && action.params.attendees.length ? action.params.attendees.join(", ") : "None"}</div>}
       {task?.id && <p className="muted">Task ID: <code>{task.id}</code>{task.status ? ` · ${task.status}` : ""}</p>}
       {action.result && !action.result.success && <div className="inline-error"><AlertCircle size={15} />{action.result.error?.message ?? "Action failed."}</div>}
       {pending && <div className="button-row action-buttons">
@@ -404,20 +410,20 @@ export default function App() {
 
         <section className="panel gmail-panel">
           <div className="panel-title-row calendar-panel-heading">
-            <div><p className="eyebrow">READ-ONLY INTEGRATION</p><h3>Gmail</h3></div>
+            <div><p className="eyebrow">READS · APPROVAL-GATED WRITES</p><h3>Gmail</h3></div>
             <StatusPill status={gmailStatus} />
           </div>
           <div className="calendar-connection-row">
             <span className="calendar-icon gmail-icon"><Mail size={18} /></span>
             <div className="calendar-copy">
               <strong>{gmailStatus === "connected" ? "Gmail connected" : gmailStatus === "reauthorization_required" ? "Reconnect required" : gmailStatus === "unavailable" ? "Gmail status unavailable" : "Gmail not connected"}</strong>
-              <span>{gmailStatus === "connected" ? "ManageBizz can inspect message headers and communication history. Message bodies are not retrieved." : gmailStatus === "reauthorization_required" ? "Google authorization expired. Reconnect Gmail to restore email reads." : gmailStatus === "unavailable" ? "Connection status could not be confirmed. Retry to check Gmail." : "Connect Gmail to let ManageBizz inspect relevant email activity."}</span>
+              <span>{gmailStatus === "connected" ? "ManageBizz can inspect communication history and prepare or send proposed messages only after your approval." : gmailStatus === "reauthorization_required" ? "Google authorization expired. Reconnect Gmail to restore access." : gmailStatus === "unavailable" ? "Connection status could not be confirmed. Retry to check Gmail." : "Connect Gmail to inspect communication history and enable approved email actions."}</span>
             </div>
             {gmailStatus === "unavailable"
               ? <button className="button button-secondary" onClick={() => void refreshGmail()}><RefreshCw size={15} /> Retry status</button>
               : gmailStatus === "disconnected" || gmailStatus === "reauthorization_required"
               ? <button className="button button-secondary" disabled={gmailBusy || apiState !== "available"} onClick={() => void handleConnectGmail()}>{gmailBusy ? <><LoaderCircle className="spin" size={15} /> Connecting…</> : <><ExternalLink size={15} /> Connect Gmail</>}</button>
-              : <button className="button button-secondary" disabled={gmailBusy} onClick={() => void handleDisconnectGmail()}>{gmailBusy ? <><LoaderCircle className="spin" size={15} /> Disconnecting…</> : "Disconnect"}</button>}
+              : <><button className="button button-secondary" disabled={gmailBusy || apiState !== "available"} onClick={() => void handleConnectGmail()}>{gmailBusy ? <><LoaderCircle className="spin" size={15} /> Reconnecting…</> : "Update Gmail access"}</button><button className="button button-secondary" disabled={gmailBusy} onClick={() => void handleDisconnectGmail()}>{gmailBusy ? <><LoaderCircle className="spin" size={15} /> Disconnecting…</> : "Disconnect"}</button></>}
           </div>
           {gmailError && <div className="inline-error calendar-message"><AlertCircle size={15} />{gmailError}</div>}
           <div className="calendar-activity-heading"><strong>Recent email activity</strong>{gmailStatus === "connected" && <button className="icon-button" aria-label="Refresh email activity" onClick={() => void refreshGmail()}><RefreshCw size={15} /></button>}</div>
@@ -426,23 +432,23 @@ export default function App() {
             : gmailStatus === "reauthorization_required" ? <EmptyNotice title="Gmail needs reconnecting" detail="Email data is unavailable until Google authorization is restored." />
               : emailActivity.length === 0 ? <EmptyNotice title="No recent email activity" detail="Gmail returned no matching messages for the recent activity search." />
                 : <div className="calendar-event-list">{emailActivity.map((message) => <article className="calendar-event email-event" key={message.id}><span className="event-date"><Mail size={14} />{message.sentAt ? new Date(message.sentAt).toLocaleDateString() : "Date unavailable"}</span><div><strong>{message.subject ?? "Subject unavailable"}</strong><span>{message.direction === "OUTBOUND" ? "Sent" : "Received"}{message.leadEmail ? ` · ${message.leadEmail}` : ""}{message.sentAt ? ` · ${new Date(message.sentAt).toLocaleString()}` : ""}</span><StatusPill status={message.responseStatus} /></div></article>)}</div>}
-          <p className="crm-upload-hint">Read-only header access. ManageBizz cannot send or modify email. Message content is not fetched.</p>
+          <p className="crm-upload-hint">Email drafts and sends are shown for approval before execution. Message history reads use metadata.</p>
         </section>
 
         <section className="panel calendar-panel">
           <div className="panel-title-row">
-            <div><p className="eyebrow">READ-ONLY INTEGRATION</p><h3>Google Calendar</h3></div>
+            <div><p className="eyebrow">READS · APPROVAL-GATED WRITES</p><h3>Google Calendar</h3></div>
             <StatusPill status={calendarStatus} />
           </div>
           <div className="calendar-connection-row">
             <span className="calendar-icon"><CalendarDays size={18} /></span>
             <div className="calendar-copy">
               <strong>{calendarStatus === "connected" ? "Calendar connected" : calendarStatus === "reauthorization_required" ? "Reconnect required" : "Calendar not connected"}</strong>
-              <span>{calendarStatus === "connected" ? "ManageBizz can read your upcoming events and event details." : calendarStatus === "reauthorization_required" ? "Google authorization expired. Reconnect to restore calendar reads." : "Connect Google Calendar to let ManageBizz inspect event activity."}</span>
+              <span>{calendarStatus === "connected" ? "ManageBizz can inspect events and propose new events. Calendar changes require your approval." : calendarStatus === "reauthorization_required" ? "Google authorization expired. Reconnect to restore calendar access." : "Connect Google Calendar to inspect activity and enable approved event creation."}</span>
             </div>
             {calendarStatus === "disconnected" || calendarStatus === "reauthorization_required"
               ? <button className="button button-secondary" disabled={calendarBusy || apiState !== "available"} onClick={() => void handleConnectCalendar()}>{calendarBusy ? <><LoaderCircle className="spin" size={15} /> Connecting…</> : <><ExternalLink size={15} /> Connect Google Calendar</>}</button>
-              : <button className="button button-secondary" disabled={calendarBusy} onClick={() => void handleDisconnectCalendar()}>{calendarBusy ? <><LoaderCircle className="spin" size={15} /> Disconnecting…</> : "Disconnect"}</button>}
+              : <><button className="button button-secondary" disabled={calendarBusy || apiState !== "available"} onClick={() => void handleConnectCalendar()}>{calendarBusy ? <><LoaderCircle className="spin" size={15} /> Reconnecting…</> : "Update Calendar access"}</button><button className="button button-secondary" disabled={calendarBusy} onClick={() => void handleDisconnectCalendar()}>{calendarBusy ? <><LoaderCircle className="spin" size={15} /> Disconnecting…</> : "Disconnect"}</button></>}
           </div>
           {calendarError && <div className="inline-error calendar-message"><AlertCircle size={15} />{calendarError}</div>}
           <div className="calendar-activity-heading"><strong>Upcoming calendar activity</strong>{calendarStatus === "connected" && <button className="icon-button" aria-label="Refresh calendar activity" onClick={() => void refreshCalendar()}><RefreshCw size={15} /></button>}</div>
@@ -533,7 +539,12 @@ export default function App() {
 
               <section className="panel">
                 <div className="panel-title-row"><div><p className="eyebrow">PLAN · APPROVAL · EXECUTION</p><h3>Actions</h3></div><span className="count-label">{run.actions.length}</span></div>
-                {run.actions.length === 0 ? <EmptyNotice title="No actions proposed" detail="The agent did not propose a mutation for this goal." /> : <div className="action-list">{run.actions.map((action) => <ActionCard key={action.id} action={action} busy={busyAction !== null} onDecision={(selected, decision) => void handleDecision(selected, decision)} />)}</div>}
+                {run.actions.length === 0 ? <EmptyNotice title="No actions proposed" detail="The agent did not propose a mutation for this goal." /> : <div className="action-list">{run.actions.map((action) => {
+                  const draftId = typeof action.params.draftId === "string" ? action.params.draftId : undefined;
+                  const related = draftId ? run.actions.find((candidate) => candidate.action === "draftEmail" && candidate.result?.success && typeof candidate.result.data === "object" && candidate.result.data !== null && "draftId" in candidate.result.data && candidate.result.data.draftId === draftId) : undefined;
+                  const draftData = related?.result?.success && typeof related.result.data === "object" && related.result.data !== null ? related.result.data as { to?: string; subject?: string; body?: string } : undefined;
+                  return <ActionCard key={action.id} action={action} relatedDraft={draftData} busy={busyAction !== null} onDecision={(selected, decision) => void handleDecision(selected, decision)} />;
+                })}</div>}
               </section>
             </div>
 
@@ -546,7 +557,7 @@ export default function App() {
           </div>
         </>}
 
-        <section className="data-source-note"><Database size={16} /><span><strong>Business data connection</strong> · CRM uploads, read-only Google Calendar, and read-only Gmail are available. Empty API results are shown as empty; no business records are fabricated.</span></section>
+        <section className="data-source-note"><Database size={16} /><span><strong>Business data connection</strong> · CRM uploads, Gmail, and Google Calendar are connected to workspace-scoped tools. External writes require approval and verification. Empty API results are shown as empty; no business records are fabricated.</span></section>
       </main>
       <footer className="footer"><span>ManageBizz</span><span>Business operations workspace</span></footer>
     </div>

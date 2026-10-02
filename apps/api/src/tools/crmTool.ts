@@ -8,7 +8,7 @@ export type CRMToolOptions = { clock?: () => Date; repository?: CRMRepository };
 const cloneLead = (lead: CRMLead): CRMLead => ({ ...lead, lastContactedAt: new Date(lead.lastContactedAt), notes: [...lead.notes] });
 const activeSchema = z.object({ minDealValue: nonNegativeNumber }).strict();
 const inactiveSchema = z.object({ minDaysInactive: nonNegativeNumber.default(30), minDealValue: nonNegativeNumber.default(DEFAULT_MIN_DEAL_VALUE) }).strict();
-const searchSchema = z.object({ query: z.string().trim().optional(), status: z.string().trim().min(1).optional() }).strict();
+const searchSchema = z.object({ query: z.string().trim().optional(), status: z.string().trim().min(1).optional(), minDealValue: nonNegativeNumber.optional() }).strict();
 const updateSchema = z.object({ leadId: nonEmpty, status: nonEmpty.optional(), dealValue: nonNegativeNumber.optional() }).strict();
 const noteSchema = z.object({ leadId: nonEmpty, note: nonEmpty }).strict();
 
@@ -37,10 +37,11 @@ export class CRMToolService {
   }
 
   searchLeads(params: unknown, context: ToolExecutionContext): Promise<ToolResponse<CRMLead[]>> {
-    return runValidated(searchSchema, params, context, async ({ query, status }) => {
+    return runValidated(searchSchema, params, context, async ({ query, status, minDealValue }) => {
       const needle = (query ?? "").toLocaleLowerCase("en-US");
       return (await this.leadsFor(context)).filter((lead) =>
         (!status || lead.status?.toLocaleLowerCase("en-US") === status.toLocaleLowerCase("en-US")) &&
+        (minDealValue === undefined || lead.dealValue >= minDealValue) &&
         (!needle || [lead.name, lead.company, lead.email].some((value) => value.toLocaleLowerCase("en-US").includes(needle)))
       ).map(cloneLead);
     });

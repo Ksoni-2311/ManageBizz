@@ -1,20 +1,20 @@
 import { ToolExecutionContext, ToolResponse } from "@nexusops/shared-types";
 import { z } from "zod";
-import { emailAddress, nonEmpty, runValidated, ToolDomainError } from "./contract.js";
-import { EmailIdentity, EmailProvider, EmailSearch, GmailProvider, MockEmailProvider, ProviderEmail } from "../integrations/gmail/emailProvider.js";
+import { emailAddress, nonEmpty, requireApprovedAction, runValidated, ToolDomainError } from "./contract.js";
+import { EmailDraftInput, EmailIdentity, EmailProvider, EmailSearch, GmailProvider, MockEmailProvider, ProviderEmail, ProviderEmailDraft, ProviderSentEmail } from "../integrations/gmail/emailProvider.js";
 import { GoogleProviderError } from "../integrations/googleOAuth/googleProviderError.js";
 
 const historySchema = z.object({ leadEmail: emailAddress.optional(), leadEmails: z.array(emailAddress).max(500).optional(), query: z.string().trim().min(1).max(500).optional() }).strict()
   .refine(({ leadEmail, leadEmails }) => !(leadEmail && leadEmails), "Use leadEmail or leadEmails, not both")
   .refine(({ leadEmails }) => !leadEmails || new Set(leadEmails.map((email) => email.toLowerCase())).size === leadEmails.length, "leadEmails must be unique")
 const metadataSchema = z.object({ messageId: nonEmpty.max(500) }).strict();
-const emailSchema = z.object({ to: emailAddress, subject: nonEmpty, body: nonEmpty }).strict();
-const sendSchema = emailSchema.extend({ draftId: nonEmpty.optional() }).strict();
+const emailSchema = z.object({ to: emailAddress, subject: nonEmpty.max(998).refine((value) => !/[\r\n]/.test(value), "Subject cannot contain line breaks."), body: nonEmpty.max(100_000) }).strict();
+const sendSchema = z.object({ draftId: nonEmpty.max(500) }).strict();
 const messageSchema = z.object({ id: nonEmpty, threadId: nonEmpty.optional(), leadEmail: emailAddress.optional(), direction: z.enum(["OUTBOUND", "INBOUND"]), subject: nonEmpty.optional(), sentAt: z.string().datetime().optional(), inReplyToMessageId: nonEmpty.optional(), messageId: nonEmpty.optional() }).strict();
 const messagesSchema = z.array(messageSchema);
 type StoredMessage = z.infer<typeof messageSchema>;
 export type EmailHistoryMessage = StoredMessage & { responseStatus: "INBOUND" | "ANSWERED" | "UNANSWERED" };
-type Draft = { draftId: string; to: string; subject: string; body: string; status: "DRAFT" };
+type Draft = ProviderEmailDraft;
 const emptyContext: ToolExecutionContext = { goalId: "", runId: "", actionId: "", userId: "", orgId: "" };
 
 /** Email domain logic delegates reads to an injected provider; it never synthesizes records. */
@@ -33,6 +33,8 @@ export class EmailService {
     return record ? messageSchema.parse(record) : undefined;
   }
   status(identity: EmailIdentity) { return this.provider.connectionStatus(identity); }
+  createDraft(identity: EmailIdentity, draft: EmailDraftInput, actionId: string) { return this.provider.createDraft(identity, draft, actionId); }
+  sendDraft(identity: EmailIdentity, draftId: string, actionId: string) { return this.provider.sendDraft(identity, draftId, actionId); }
 }
 
 export class EmailToolService {
@@ -63,13 +65,10 @@ export class EmailToolService {
     }
   }
   draftEmail(params: unknown, context: ToolExecutionContext): Promise<ToolResponse<Draft>> {
-    return runValidated(emailSchema, params, context, ({ to, subject, body }) => { const draftId = `draft-${context.actionId}`; const draft = { draftId, to, subject, body, status: "DRAFT" as const }; this.drafts.set(draftId, draft); return { ...draft }; });
+    return runValidated(emailSchema, params, context, (draft) => { requireApprovedAction(context); return this.translate(() => this.service.createDraft(identity(context), draft, context.actionId)); });
   }
-  sendEmail(params: unknown, context: ToolExecutionContext): Promise<ToolResponse<never>> {
-    return runValidated(sendSchema, params, context, ({ draftId }) => {
-      if (draftId && !this.drafts.has(draftId)) throw new ToolDomainError("NOT_FOUND", `Draft '${draftId}' was not found.`);
-      throw new ToolDomainError("INTEGRATION_UNAVAILABLE", "Email sending is disabled; no message was sent.");
-    });
+  sendEmail(params: unknown, context: ToolExecutionContext): Promise<ToolResponse<ProviderSentEmail>> {
+    return runValidated(sendSchema, params, context, ({ draftId }) => { requireApprovedAction(context); return this.translate(() => this.service.sendDraft(identity(context), draftId, context.actionId)); });
   }
 }
 function responseStatus(message: StoredMessage, records: StoredMessage[]): EmailHistoryMessage["responseStatus"] {

@@ -15,7 +15,7 @@ export type InvestigationPlan = {
   factsRequired: string[];
   toolMappings: Array<{ fact: string; tool: BusinessToolName; action: string }>;
   initialCalls: PlannedToolCall[];
-  downstream: { emailHistoryForCandidates: boolean; emailAction: "getEmailHistory" | "getUnansweredMessages"; calendarAvailabilityForCandidates: boolean; calendarParams: Record<string, unknown> };
+  downstream: { emailHistoryForCandidates: boolean; emailAction: "getEmailHistory" | "getUnansweredMessages"; calendarAvailabilityForCandidates: boolean; calendarParams: Record<string, unknown>; sendFollowUpForCandidates: boolean; createFollowUpTasksForCandidates: boolean };
   finalEvidence: string[];
 };
 
@@ -82,22 +82,47 @@ function requestedTaskAction(objective: string): PlannedToolCall | undefined {
   return undefined;
 }
 
+/** Direct external writes require an explicit, complete imperative from the user. */
+function requestedDirectAction(objective: string): PlannedToolCall | undefined {
+  const draft = objective.match(/^\s*(?:please\s+)?draft email to\s+(\S+)\s+subject\s+"([^"\r\n]+)"\s+body\s+"([\s\S]+)"\s*$/i);
+  if (draft) return { tool: "email", action: "draftEmail", params: { to: draft[1], subject: draft[2], body: draft[3] }, purpose: "Create exactly the email draft explicitly supplied by the user; wait for approval and verify Gmail's returned draft." };
+  const send = objective.match(/^\s*(?:please\s+)?send (?:the )?email draft\s+([A-Za-z0-9._:-]+)\s*$/i);
+  if (send) return { tool: "email", action: "sendEmail", params: { draftId: send[1] }, purpose: "Send only the identified existing Gmail draft after approval, then verify the sent message." };
+  const event = objective.match(/^\s*(?:please\s+)?create calendar event titled\s+"([^"\r\n]+)"\s+from\s+(\d{4}-\d{2}-\d{2}T[^\s]+)\s+to\s+(\d{4}-\d{2}-\d{2}T[^\s]+)(?:\s+attendees?\s+(.+))?\s*$/i);
+  if (event) return { tool: "calendar", action: "createMeeting", params: {
+    title: event[1], startTime: event[2], endTime: event[3],
+    attendees: event[4] ? event[4].split(/[;,\s]+/).filter(Boolean) : []
+  }, purpose: "Create exactly the calendar event requested by the user after approval, then verify Google's returned event." };
+  return undefined;
+}
+
 /** A small deterministic planner: one root query, then only evidence-gated follow-up queries. */
 export function planBusinessGoal(parsed: ParsedGoal): InvestigationPlan {
   const objective = parsed.objective.trim();
   const lower = objective.toLocaleLowerCase("en-US");
-  const taskAction = requestedTaskAction(objective);
-  const intentLower = taskAction
+  const directAction = requestedDirectAction(objective);
+  const taskAction = directAction ? undefined : requestedTaskAction(objective);
+  const intentLower = directAction ? "" : taskAction
     ? lower.replace(/\b(?:create|add)\s+(?:a\s+)?task\s+(?:titled|called)\s+["'][^"']+["']/i, "")
       .replace(/\b(?:create|add)\s+(?:a\s+)?task\s*:\s*["']?[^"'\r\n.]+["']?/i, "")
     : lower;
-  const mentionsLeads = matches(lower, /\b(lead|leads|prospect|prospects)\b/);
-  const highValueRequested = matches(lower, /\bhigh[- ]?value\b/) || parseRequestedMinimumDealValue(objective) !== undefined;
-  const wantsInactiveLeads = mentionsLeads && highValueRequested && matches(lower, /\b(inactive|stale|dormant)\b/);
+  const mentionsLeads = matches(intentLower, /\b(lead|leads|prospect|prospects)\b/) ||
+    matches(intentLower, /\b(attention|follow[- ]?up)\b/);
+  const highValueRequested = matches(intentLower, /\bhigh[- ]?value\b/) || parseRequestedMinimumDealValue(objective) !== undefined ||
+    (mentionsLeads && matches(intentLower, /\b(attention|follow[- ]?up|stale|dormant)\b/));
+  // For the MVP, "needs attention" means a high-value lead whose last contact
+  // is older than the requested/default recency window. Pipeline status remains
+  // a separate definition used only by the active query.
+  const wantsInactiveLeads = mentionsLeads && highValueRequested && matches(lower, /\b(inactive|stale|dormant|attention|follow[- ]?up)\b/);
   const wantsActiveLeads = mentionsLeads && highValueRequested && matches(lower, /\bactive\b/);
   const hasUnsupportedUpperBound = highValueRequested && /\b(below|under|less than|at most|maximum)\b|<=|≤/i.test(lower);
-  const wantsLeadInvestigation = !hasUnsupportedUpperBound && (wantsInactiveLeads || wantsActiveLeads);
-  const wantsEmail = matches(intentLower, /\b(email|emails|communication|repl(?:y|ied|ies)|response|outreach|follow[- ]?up|re-engage|reengage|unanswered messages?)\b/);
+  const wantsHighValueLeads = mentionsLeads && highValueRequested;
+  const wantsLeadInvestigation = !hasUnsupportedUpperBound && wantsHighValueLeads;
+  const createFollowUpTasksForCandidates = wantsLeadInvestigation && !taskAction &&
+    matches(objective, /\b(?:create|add)\b[\s\S]{0,50}\b(?:tasks?)\b/i) &&
+    matches(objective, /\b(follow[- ]?up|these leads|those leads|them)\b/i);
+  const wantsEmail = !createFollowUpTasksForCandidates && matches(intentLower, /\b(email|emails|communication|repl(?:y|ied|ies)|response|outreach|follow[- ]?up|re-engage|reengage|unanswered messages?)\b/);
+  const sendFollowUpForCandidates = wantsInactiveLeads && matches(objective, /^\s*(?:please\s+)?(?:follow[- ]?up with|send follow[- ]?up(?: emails?)? to|email all)\b/i);
   const emailAction: InvestigationPlan["downstream"]["emailAction"] = matches(intentLower, /\b(unanswered|unreplied)\b/) ? "getUnansweredMessages" : "getEmailHistory";
   const wantsCalendar = matches(intentLower, /\b(calendar|availability|schedule|scheduling|meeting|time slots?)\b/);
   const wantsTasks = matches(intentLower, /\b(open tasks?|list tasks?|show tasks?)\b/);
@@ -109,8 +134,8 @@ export function planBusinessGoal(parsed: ParsedGoal): InvestigationPlan {
   const initialCalls: PlannedToolCall[] = [];
 
   if (wantsLeadInvestigation) {
-    const action = wantsActiveLeads && !wantsInactiveLeads ? "listActiveHighValueLeads" : "listInactiveLeads";
-    const fact = action === "listInactiveLeads" ? "Matching inactive high-value CRM leads" : "Matching active high-value CRM leads";
+    const action = wantsInactiveLeads ? "listInactiveLeads" : wantsActiveLeads ? "listActiveHighValueLeads" : "searchLeads";
+    const fact = action === "listInactiveLeads" ? "Matching inactive high-value CRM leads" : action === "listActiveHighValueLeads" ? "Matching active high-value CRM leads" : "Matching high-value CRM leads";
     factsRequired.push(fact);
     toolMappings.push({ fact, tool: "crm", action });
     initialCalls.push({
@@ -134,6 +159,13 @@ export function planBusinessGoal(parsed: ParsedGoal): InvestigationPlan {
     factsRequired.push(fact);
     toolMappings.push({ fact, tool: "tasks", action: taskAction.action });
     initialCalls.push(taskAction);
+  }
+
+  if (directAction) {
+    const fact = `${directAction.action} result`;
+    factsRequired.push(fact);
+    toolMappings.push({ fact, tool: directAction.tool, action: directAction.action });
+    initialCalls.push(directAction);
   }
 
   if (metric && !wantsLeadInvestigation) {
@@ -165,8 +197,14 @@ export function planBusinessGoal(parsed: ParsedGoal): InvestigationPlan {
     emailHistoryForCandidates: wantsLeadInvestigation && wantsEmail,
     emailAction,
     calendarAvailabilityForCandidates: wantsLeadInvestigation && wantsCalendar,
-    calendarParams: requestedCalendarParams
+    calendarParams: requestedCalendarParams,
+    sendFollowUpForCandidates,
+    createFollowUpTasksForCandidates
   };
+  if (downstream.createFollowUpTasksForCandidates) {
+    factsRequired.push("Verified task records for CRM-matched leads");
+    toolMappings.push({ fact: "Verified task records for CRM-matched leads", tool: "tasks", action: "createTask" });
+  }
   if (downstream.emailHistoryForCandidates) {
     factsRequired.push("Email history for CRM-matched candidates");
     toolMappings.push({ fact: "Email history for CRM-matched candidates", tool: "email", action: "getEmailHistory" });
@@ -187,9 +225,12 @@ export function planBusinessGoal(parsed: ParsedGoal): InvestigationPlan {
 }
 
 function finalText(plan: InvestigationPlan, observations: readonly ToolObservation[], error?: string): string {
-  const crmObservation = observations.find(({ tool, action }) => tool === "crm" && (action === "listInactiveLeads" || action === "listActiveHighValueLeads"));
+  const crmObservation = observations.find(({ tool, action }) => tool === "crm" && ["listInactiveLeads", "listActiveHighValueLeads", "searchLeads"].includes(action));
   if (crmObservation?.result.success && Array.isArray(crmObservation.result.data) && crmObservation.result.data.length === 0) {
     const evidenceRef = `crm.${crmObservation.action}#${observations.indexOf(crmObservation) + 1}`;
+    if (plan.downstream.createFollowUpTasksForCandidates) {
+      return `FACT: No matching leads were found [evidence: ${evidenceRef}].\nRECOMMENDATION: No matching leads were found, so there are no follow-up actions to create.`;
+    }
     if (crmObservation.action === "listInactiveLeads") {
       return [
         `FACT: No inactive high-value leads were found [evidence: ${evidenceRef}].`,
@@ -198,7 +239,7 @@ function finalText(plan: InvestigationPlan, observations: readonly ToolObservati
       ].join("\n");
     }
     return [
-      `FACT: No active high-value leads were found [evidence: ${evidenceRef}].`,
+      `FACT: ${crmObservation.action === "searchLeads" ? "No matching records were found" : "No active high-value leads were found"} [evidence: ${evidenceRef}].`,
       "INFERENCE: No lead-specific conclusion can be drawn from an empty CRM result. Insufficient evidence to determine whether any action is needed.",
       "RECOMMENDATION: No lead-specific action is supported by the available evidence."
     ].join("\n");
@@ -207,9 +248,20 @@ function finalText(plan: InvestigationPlan, observations: readonly ToolObservati
   const lines: string[] = [];
   for (const [index, observation] of observations.entries()) {
     const evidenceRef = `${observation.tool}.${observation.action}#${index + 1}`;
+    const isWrite = (observation.tool === "email" && (observation.action === "draftEmail" || observation.action === "sendEmail")) ||
+      (observation.tool === "calendar" && observation.action === "createMeeting");
+    if (isWrite) {
+      const statement = verifiedActionStatement(observation.tool, observation.action, observation.result, observation.params);
+      if (statement) lines.push(`FACT: ${statement} [evidence: ${evidenceRef}]`);
+      else if (!observation.result.success && observation.result.error.code === "APPROVAL_REJECTED") lines.push(`FACT: The proposed ${observation.tool}.${observation.action} action was rejected; it was not executed [evidence: ${evidenceRef}].`);
+      else if (!observation.result.success && observation.result.error.code === "VERIFICATION_FAILED") lines.push(`FACT: ${observation.tool}.${observation.action} execution could not be verified; no success claim is made [evidence: ${evidenceRef}].`);
+      else if (!observation.result.success) lines.push(`FACT: ${observation.tool}.${observation.action} failed (${observation.result.error.code}); no successful action was confirmed [evidence: ${evidenceRef}].`);
+      else lines.push(`FACT: ${observation.tool}.${observation.action} returned success without verifiable action details; the action is not confirmed [evidence: ${evidenceRef}].`);
+      continue;
+    }
     if (observation.tool === "tasks" && (observation.action === "createTask" || observation.action === "completeTask")) {
       const result = observation.result;
-      const confirmedStatement = verifiedActionStatement(observation.tool, observation.action, result);
+      const confirmedStatement = verifiedActionStatement(observation.tool, observation.action, result, observation.params);
       if (confirmedStatement) {
         lines.push(`FACT: ${confirmedStatement} [evidence: ${evidenceRef}].`);
       } else if (!result.success) {
@@ -234,13 +286,32 @@ function finalText(plan: InvestigationPlan, observations: readonly ToolObservati
       else if (observation.tool === "tasks") lines.push(`FACT: No matching open tasks were found [evidence: ${evidenceRef}].`);
       else if (observation.tool === "analytics") lines.push(`FACT: No matching metrics were returned [evidence: ${evidenceRef}].`);
       else lines.push(`FACT: No matching records were found [evidence: ${evidenceRef}].`);
+    } else if (observation.tool === "crm" && Array.isArray(observation.result.data) && observation.result.success) {
+      const records = observation.result.data;
+      const crmAction = observation.action === "listInactiveLeads" ? "inactive high-value" : observation.action === "listActiveHighValueLeads" ? "active high-value" : "high-value";
+      lines.push(`FACT: CRM returned ${records.length} matching ${crmAction} lead(s) [evidence: ${evidenceRef}].`);
+      for (const record of records) {
+        if (!record || typeof record !== "object") continue;
+        const lead = record as Record<string, unknown>;
+        const details = [
+          typeof lead.name === "string" ? lead.name : undefined,
+          typeof lead.company === "string" ? `company ${lead.company}` : undefined,
+          typeof lead.dealValue === "number" ? `deal value ${lead.dealValue}` : undefined,
+          typeof lead.status === "string" ? `pipeline status ${lead.status}` : undefined,
+          lead.lastContactedAt instanceof Date ? `last contacted ${lead.lastContactedAt.toISOString()}` : undefined
+        ].filter(Boolean);
+        if (details.length) lines.push(`FACT: ${details.join("; ")} [evidence: ${evidenceRef}].`);
+      }
+      if (observation.action === "listInactiveLeads") {
+        lines.push(`INFERENCE: These leads meet the CRM's high-value and contact-recency criteria; recency alone does not establish email response status [evidence: ${evidenceRef}].`);
+        lines.push(`RECOMMENDATION: Review these matching leads to decide whether follow-up is appropriate [evidence: ${evidenceRef}].`);
+      } else if (matches(plan.objective, /\b(attention|follow[- ]?up|why)\b/i)) {
+        lines.push("INFERENCE: High deal value alone is insufficient to establish that a lead needs follow-up.");
+        lines.push("RECOMMENDATION: Review pipeline status and communication recency before prioritizing follow-up.");
+      }
     } else {
       const count = Array.isArray(observation.result.data) ? ` ${observation.result.data.length} matching record(s)` : " matching data";
       lines.push(`FACT: ${observation.tool}.${observation.action} returned${count} [evidence: ${evidenceRef}].`);
-      if (observation.tool === "crm" && observation.action === "listInactiveLeads" && Array.isArray(observation.result.data)) {
-        lines.push("INFERENCE: The returned records match the CRM query's inactive high-value criteria.");
-        lines.push("RECOMMENDATION: Review these matching leads to decide whether follow-up is appropriate [evidence: " + evidenceRef + "].");
-      }
     }
   }
 
@@ -262,7 +333,7 @@ function finalText(plan: InvestigationPlan, observations: readonly ToolObservati
   return lines.join("\n");
 }
 
-function isLeadRecord(value: unknown): value is { email: string } {
+function isLeadRecord(value: unknown): value is { email: string; name?: string } {
   return typeof value === "object" && value !== null && "email" in value &&
     typeof (value as { email?: unknown }).email === "string" && (value as { email: string }).email.includes("@");
 }
@@ -318,12 +389,29 @@ export class ControlledAgentOrchestrator {
         break;
       }
 
-      if (call.tool === "crm" && (call.action === "listInactiveLeads" || call.action === "listActiveHighValueLeads")) {
+      if (call.tool === "crm" && ["listInactiveLeads", "listActiveHighValueLeads", "searchLeads"].includes(call.action)) {
         if (!Array.isArray(result.data)) {
           stopError = `${call.tool}.${call.action} returned an invalid record collection`;
           break;
         }
         if (result.data.length === 0) break;
+
+        if (plan.downstream.createFollowUpTasksForCandidates) {
+          const leads = result.data.filter((value): value is { id: string; name: string } =>
+            typeof value === "object" && value !== null &&
+            typeof (value as { id?: unknown }).id === "string" && !!(value as { id: string }).id.trim() &&
+            typeof (value as { name?: unknown }).name === "string" && !!(value as { name: string }).name.trim()
+          );
+          for (const lead of leads) {
+            const task = await callTool({
+              tool: "tasks", action: "createTask",
+              params: { title: `Follow up with ${lead.name.trim()}`, leadId: lead.id, priority: "MEDIUM" },
+              purpose: "Propose a follow-up task only for this lead returned by CRM; approval is required before task creation and the task tool must verify persistence."
+            });
+            if (!task.success) { stopError = `tasks.createTask returned ${task.error.code}`; break; }
+          }
+          if (stopError) break;
+        }
 
         const candidateEmails = result.data.filter(isLeadRecord).map((lead) => lead.email);
         const uniqueEmails = [...new Set(candidateEmails.map((email) => email.toLocaleLowerCase("en-US")))];
@@ -339,6 +427,35 @@ export class ControlledAgentOrchestrator {
           };
           const emailResult = await callTool(emailCall);
           if (!emailResult.success) { stopError = `email.getEmailHistory returned ${emailResult.error.code}`; break; }
+        }
+
+        if (plan.downstream.sendFollowUpForCandidates) {
+          const candidateByEmail = new Map<string, { email: string; name: string }>();
+          for (const value of result.data) {
+            if (isLeadRecord(value) && typeof value.name === "string" && value.name.trim()) candidateByEmail.set(value.email.toLowerCase(), { email: value.email, name: value.name.trim() });
+          }
+          const candidates = [...candidateByEmail.values()];
+          for (const lead of candidates) {
+            const draft = await callTool({
+              tool: "email", action: "draftEmail",
+              params: {
+                to: lead.email,
+                subject: "Following up",
+                body: `Hi ${lead.name.trim()},\n\nI'm following up to see whether you'd like to discuss next steps.`
+              },
+              purpose: "Prepare neutral follow-up wording using only the lead name and address returned by CRM. The user asked for follow-up; approval is still required before any external action."
+            });
+            if (!draft.success) { stopError = `email.draftEmail returned ${draft.error.code}`; break; }
+            const draftId = typeof draft.data === "object" && draft.data !== null && "draftId" in draft.data && typeof (draft.data as { draftId?: unknown }).draftId === "string"
+              ? (draft.data as { draftId: string }).draftId : undefined;
+            if (!draftId) { stopError = "email.draftEmail returned no verifiable Gmail draft ID"; break; }
+            const sent = await callTool({
+              tool: "email", action: "sendEmail", params: { draftId },
+              purpose: "Send the approved Gmail draft for a CRM-matched lead, then verify Gmail's sent-message result."
+            });
+            if (!sent.success) { stopError = `email.sendEmail returned ${sent.error.code}`; break; }
+          }
+          if (stopError) break;
         }
 
         if (plan.downstream.calendarAvailabilityForCandidates) {

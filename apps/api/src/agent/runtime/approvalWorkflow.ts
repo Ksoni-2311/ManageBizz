@@ -71,11 +71,11 @@ export class ApprovalActionWorkflow {
   async proposeExecuteVerify(
     call: PlannedToolCall,
     context: ToolExecutionContext,
-    executor: () => Promise<ToolResponse>
+  executor: (context?: ToolExecutionContext) => Promise<ToolResponse>
   ): Promise<ToolResponse> {
     const mutation = ACTION_TOOL_ACTIONS[call.tool]?.includes(call.action) ?? false;
     const riskLevel = PolicyEngine.classifyRisk(call.tool, call.action, call.params);
-    if (!mutation) return executor();
+    if (!mutation) return executor(context);
 
     const proposal: ActionProposal = {
       id: `${context.runId}:approval:${context.actionId}`,
@@ -106,7 +106,7 @@ export class ApprovalActionWorkflow {
     await this.options.onUpdate?.(structuredClone(proposal));
     let result: ToolResponse;
     try {
-      result = await executor();
+      result = await executor({ ...context, approvedActionId: context.actionId });
     } catch (error) {
       result = {
         success: false,
@@ -126,7 +126,7 @@ export class ApprovalActionWorkflow {
     await this.options.onUpdate?.(structuredClone(proposal));
     proposal.lifecycle = "VERIFYING";
     await this.options.onUpdate?.(structuredClone(proposal));
-    const verificationPassed = verifiedActionStatement(call.tool, call.action, result) !== undefined;
+    const verificationPassed = verifiedActionStatement(call.tool, call.action, result, call.params) !== undefined;
     if (!verificationPassed) {
       proposal.lifecycle = "VERIFICATION_FAILED";
       proposal.verification = "FAILED";

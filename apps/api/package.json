@@ -8,7 +8,7 @@
     "dev": "tsx watch src/index.ts",
     "start": "node dist/index.js",
     "typecheck": "tsc --noEmit",
-    "test": "tsx --test src/test/authentication.test.ts src/test/crm.test.ts src/test/crm-ingestion.test.ts src/test/business-ownership.test.ts src/test/calendar-integration.test.ts src/test/gmail-integration.test.ts src/test/tool-contracts.test.ts src/test/scenario.test.ts src/test/agent-integrity.test.ts src/test/controlled-orchestrator.test.ts src/test/action-tools.test.ts src/test/approval-workflow.test.ts src/test/run-trace.test.ts src/test/application-api.test.ts src/test/system-read-tools.test.ts"
+    "test": "tsx --test src/test/authentication.test.ts src/test/crm.test.ts src/test/crm-ingestion.test.ts src/test/business-ownership.test.ts src/test/calendar-integration.test.ts src/test/gmail-integration.test.ts src/test/tool-contracts.test.ts src/test/scenario.test.ts src/test/agent-integrity.test.ts src/test/controlled-orchestrator.test.ts src/test/action-tools.test.ts src/test/approval-workflow.test.ts src/test/run-trace.test.ts src/test/application-api.test.ts src/test/system-read-tools.test.ts src/test/llm-response.test.ts"
   },
   "dependencies": {
     "@nexusops/shared-types": "workspace:*",

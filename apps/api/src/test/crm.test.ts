@@ -64,4 +64,16 @@ describe("CRM domain", () => {
     assert.equal(response.success, true);
     assert.deepEqual(response.data, []);
   });
+
+  it("applies a requested minimum deal value through the CRM search service", async () => {
+    const service = new CRMToolService({ clock: () => fixedNow });
+    service.setLeads(records, "o");
+    const context = { goalId: "g", runId: "r", actionId: "search", userId: "u", orgId: "o" };
+    const response = await service.searchLeads({ minDealValue: 100_000 }, context);
+    assert.equal(response.success, true);
+    if (response.success) {
+      assert.ok(response.data.every((lead) => lead.dealValue >= 100_000));
+      assert.ok(response.data.every((lead) => leads.some((source) => source.id === lead.id)));
+    }
+  });
 });

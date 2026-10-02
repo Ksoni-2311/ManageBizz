@@ -9,6 +9,12 @@ export class PolicyEngine {
     if (tool === "email" && action === "sendEmail") {
       return RiskLevel.HIGH;
     }
+    if (tool === "calendar" && action === "createMeeting") {
+      return RiskLevel.HIGH;
+    }
+    if (tool === "email" && action === "draftEmail") {
+      return RiskLevel.MEDIUM;
+    }
     if (action.toLowerCase().includes("delete") || action.toLowerCase().includes("purge")) {
       return RiskLevel.HIGH;
     }

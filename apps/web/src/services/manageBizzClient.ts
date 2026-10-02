@@ -89,6 +89,7 @@ export type EvidenceFact = {
 
 export type ActionProposal = {
   id: string;
+  riskLevel: string;
   tool: string;
   action: string;
   params: Record<string, unknown>;
@@ -133,9 +134,16 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 }
 
 export async function restoreSession(): Promise<AuthenticatedUser | null> {
-  if (!sessionToken()) return null;
-  const result = await request<{ user: AuthenticatedUser }>("/api/auth/me");
-  return result.user;
+  try {
+    // The API returns a fixed, server-owned development identity only when
+    // MVP_MODE is explicitly enabled in NODE_ENV=development. Normal sessions
+    // still require the stored signed token.
+    const result = await request<{ user: AuthenticatedUser }>("/api/auth/me");
+    return result.user;
+  } catch (error) {
+    if (!sessionToken() && error instanceof ManageBizzApiError && error.code === "AUTH_REQUIRED") return null;
+    throw error;
+  }
 }
 export async function authenticate(email: string, password: string, name?: string): Promise<AuthenticatedUser> {
   const path = name === undefined ? "/api/auth/login" : "/api/auth/register";

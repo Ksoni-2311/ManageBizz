@@ -36,6 +36,8 @@ export interface ToolExecutionContext {
   actionId: string;
   userId: string;
   orgId: string;
+  /** Server-internal marker attached only after an approval workflow accepts the proposal. */
+  approvedActionId?: string;
 }
 
 export interface BusinessToolContract<TInput = unknown, TOutput = unknown> {

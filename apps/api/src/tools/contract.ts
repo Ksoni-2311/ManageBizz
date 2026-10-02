@@ -10,6 +10,12 @@ export class ToolDomainError extends Error {
   constructor(readonly code: string, message: string) { super(message); }
 }
 
+export function requireApprovedAction(context: ToolExecutionContext): void {
+  if (!context.actionId || context.approvedActionId !== context.actionId) {
+    throw new ToolDomainError("APPROVAL_REQUIRED", "This mutation requires an explicit approval decision before execution.");
+  }
+}
+
 export function ok<T>(data: T, context: ToolExecutionContext): ToolResponse<T> {
   return { success: true, data, metadata: { executionTimeMs: 0, actionId: context.actionId } };
 }
@@ -26,6 +32,9 @@ export async function runValidated<I, O>(
   schema: ZodType<I>, input: unknown, context: ToolExecutionContext,
   handler: (params: I) => O | Promise<O>
 ): Promise<ToolResponse<O>> {
+  if (!context.userId?.trim() || !context.orgId?.trim()) {
+    return fail("AUTH_REQUIRED", "Business tools require an authenticated user and workspace context.", context);
+  }
   const parsed = schema.safeParse(input);
   if (!parsed.success) {
     return fail("INVALID_INPUT", "Tool input did not match the required contract.", context,

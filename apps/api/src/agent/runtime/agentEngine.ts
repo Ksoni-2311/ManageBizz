@@ -94,7 +94,7 @@ export class AgentEngine {
 
   private async executeToolCall(call: PlannedToolCall, context: ToolExecutionContext) {
     if (ACTION_TOOL_ACTIONS[call.tool]?.includes(call.action)) {
-      return this.actionWorkflow.proposeExecuteVerify(call, context, () => this.executeApprovedAction(call, context));
+      return this.actionWorkflow.proposeExecuteVerify(call, context, (approvedContext) => this.executeApprovedAction(call, approvedContext ?? context));
     }
     return this.executeApprovedAction(call, context);
   }

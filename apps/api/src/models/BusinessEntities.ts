@@ -102,6 +102,8 @@ export interface IToolExecution extends Document {
   action: string;
   params: Record<string, unknown>;
   result: Record<string, unknown>;
+  paramsHash?: string;
+  executionStatus?: "PENDING" | "SUCCEEDED" | "FAILED";
   executedAt: Date;
 }
 
@@ -116,6 +118,8 @@ const ToolExecutionSchema = new Schema<IToolExecution>({
   action: { type: String, required: true },
   params: { type: Schema.Types.Mixed, default: {} },
   result: { type: Schema.Types.Mixed, default: {} },
+  paramsHash: { type: String },
+  executionStatus: { type: String, enum: ["PENDING", "SUCCEEDED", "FAILED"], default: "SUCCEEDED", index: true },
   executedAt: { type: Date, default: Date.now }
 });
 

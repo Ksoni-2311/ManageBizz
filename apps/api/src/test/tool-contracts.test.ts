@@ -25,9 +25,9 @@ describe("business tool contracts", () => {
     const email = new EmailToolService();
     const bad = await email.draftEmail({ to: "not-an-email", subject: "Subject", body: "Body" }, ctx);
     assert.equal(bad.success, false);
-    const send = await email.sendEmail({ to: "lead@example.test", subject: "Subject", body: "Body" }, ctx);
+    const send = await email.sendEmail({ draftId: "missing" }, { ...ctx, approvedActionId: ctx.actionId });
     assert.equal(send.success, false);
-    if (!send.success) assert.equal(send.error.code, "INTEGRATION_UNAVAILABLE");
+    if (!send.success) assert.equal(send.error.code, "EMAIL_DRAFT_NOT_FOUND");
     const history = await email.getEmailHistory({}, ctx);
     assert.equal(history.success, true);
     if (history.success) assert.deepEqual(history.data, []);
@@ -40,14 +40,14 @@ describe("business tool contracts", () => {
     const availability = await calendar.getAvailability({}, ctx);
     assert.equal(availability.success, true);
     if (availability.success) assert.deepEqual(availability.data, []);
-    const writeDisabled = await calendar.createMeeting({}, ctx);
-    assert.equal(writeDisabled.success, false);
-    if (!writeDisabled.success) assert.equal(writeDisabled.error.code, "READ_ONLY_CALENDAR");
+    const invalidCreate = await calendar.createMeeting({}, ctx);
+    assert.equal(invalidCreate.success, false);
+    if (!invalidCreate.success) assert.equal(invalidCreate.error.code, "INVALID_INPUT");
   });
 
   it("keeps task results isolated and validates status and priority values", async () => {
     const tasks = new TaskToolService();
-    const created = await tasks.createTask({ title: "Follow up", priority: "HIGH" }, ctx);
+    const created = await tasks.createTask({ title: "Follow up", priority: "HIGH" }, { ...ctx, approvedActionId: ctx.actionId });
     assert.equal(created.success, true);
     const invalid = await tasks.completeTask({ taskId: "" }, ctx);
     assert.equal(invalid.success, false);

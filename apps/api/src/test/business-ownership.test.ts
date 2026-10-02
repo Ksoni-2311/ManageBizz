@@ -10,6 +10,7 @@ import { InMemoryTaskRepository, JsonTaskRepository } from "../tools/taskReposit
 import { TaskToolService } from "../tools/taskTool.js";
 import { resolveWorkspaceScope } from "../middleware/workspace.js";
 import { workspaceIdFor } from "../domain/businessData.js";
+import { AnalyticsToolService } from "../tools/analyticsTool.js";
 
 const lead: CRMLead = {
   id: "lead-1", name: "Example", email: "example@example.test", company: "Example Co",
@@ -77,6 +78,22 @@ describe("business data ownership", () => {
     assert.deepEqual(result.data, []);
   });
 
+  it("isolates analytics events and metrics by authenticated workspace and owner", async () => {
+    const analytics = new AnalyticsToolService({ clock: () => new Date("2026-09-30T00:00:00.000Z") });
+    const workspaceA = workspaceIdFor("org", "analytics-user-a");
+    const workspaceB = workspaceIdFor("org", "analytics-user-b");
+    analytics.setEvents([
+      { id: "event-a", eventType: "LEAD_CREATED", leadId: "lead-a", occurredAt: "2026-09-29T10:00:00.000Z" }
+    ], { orgId: workspaceA, userId: "analytics-user-a" });
+
+    const own = await analytics.getLeadMetrics({}, toolContext(workspaceA, "analytics-user-a"));
+    const otherUser = await analytics.getLeadMetrics({}, toolContext(workspaceA, "analytics-user-b"));
+    const otherWorkspace = await analytics.getLeadMetrics({}, toolContext(workspaceB, "analytics-user-b"));
+    assert.deepEqual(own.success && own.data, [{ leadsCreated: 1 }]);
+    assert.deepEqual(otherUser.success && otherUser.data, []);
+    assert.deepEqual(otherWorkspace.success && otherWorkspace.data, []);
+  });
+
   it("scopes task listing and completion to the owning workspace and persists tasks", async () => {
     const directory = await mkdtemp(path.join(os.tmpdir(), "managebizz-task-owner-"));
     try {
@@ -84,7 +101,8 @@ describe("business data ownership", () => {
       const tasks = new TaskToolService(repository);
       const owner = workspaceIdFor("org", "task-owner");
       const other = workspaceIdFor("org", "task-other");
-      const created = await tasks.createTask({ title: "Review next steps" }, toolContext(owner, "task-owner", "unique-task-action"));
+      const createContext = toolContext(owner, "task-owner", "unique-task-action");
+      const created = await tasks.createTask({ title: "Review next steps" }, { ...createContext, approvedActionId: createContext.actionId });
       assert.equal(created.success, true);
       if (!created.success) return;
       assert.equal(created.data.task.workspaceId, owner);
@@ -93,7 +111,8 @@ describe("business data ownership", () => {
       const otherList = await tasks.listOpenTasks({}, toolContext(other, "task-other"));
       assert.equal(ownList.success && ownList.data.length, 1);
       assert.deepEqual(otherList.success && otherList.data, []);
-      const unauthorizedCompletion = await tasks.completeTask({ taskId: created.data.task.id }, toolContext(other, "task-other", "unauthorized-complete"));
+      const unauthorizedContext = toolContext(other, "task-other", "unauthorized-complete");
+      const unauthorizedCompletion = await tasks.completeTask({ taskId: created.data.task.id }, { ...unauthorizedContext, approvedActionId: unauthorizedContext.actionId });
       assert.equal(unauthorizedCompletion.success, false);
 
       const reopened = await new JsonTaskRepository(directory).list(owner, "task-owner");
@@ -107,7 +126,8 @@ describe("business data ownership", () => {
 
   it("allows task repository fakes without changing the tool interface", async () => {
     const tasks = new TaskToolService(new InMemoryTaskRepository());
-    const created = await tasks.createTask({ title: "Owned task" }, toolContext("workspace", "owner", "fake-task"));
+    const createContext = toolContext("workspace", "owner", "fake-task");
+    const created = await tasks.createTask({ title: "Owned task" }, { ...createContext, approvedActionId: createContext.actionId });
     assert.equal(created.success, true);
   });
 });

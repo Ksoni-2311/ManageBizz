@@ -13,11 +13,13 @@ export type CalendarEvent = {
   location?: string;
 };
 export type CalendarListQuery = { from?: string; until?: string };
+export type CalendarEventInput = { title: string; attendees: string[]; startTime: string; endTime: string; description?: string | undefined; location?: string | undefined };
 export interface CalendarProvider {
   listUpcomingEvents(identity: CalendarIdentity, query: CalendarListQuery): Promise<CalendarEvent[]>;
   findEventsForLead(identity: CalendarIdentity, leadEmail: string): Promise<CalendarEvent[]>;
   getEventDetails(identity: CalendarIdentity, eventId: string): Promise<CalendarEvent | undefined>;
   connectionStatus(identity: CalendarIdentity): Promise<{ connected: boolean; reauthorizationRequired?: boolean }>;
+  createEvent(identity: CalendarIdentity, event: CalendarEventInput, actionId: string): Promise<CalendarEvent>;
 }
 
 export class CalendarProviderError extends Error {
@@ -26,6 +28,7 @@ export class CalendarProviderError extends Error {
 
 export class MockCalendarProvider implements CalendarProvider {
   private readonly events = new Map<string, CalendarEvent[]>();
+  private readonly createdByAction = new Map<string, CalendarEvent>();
   seed(identity: CalendarIdentity, events: CalendarEvent[]): void {
     this.events.set(key(identity), events.map((event) => ({ ...event, attendees: [...event.attendees] })));
   }
@@ -45,6 +48,21 @@ export class MockCalendarProvider implements CalendarProvider {
   }
   async connectionStatus(identity: CalendarIdentity): Promise<{ connected: boolean }> {
     return { connected: this.events.has(key(identity)) };
+  }
+  async createEvent(identity: CalendarIdentity, input: CalendarEventInput, actionId: string): Promise<CalendarEvent> {
+    const actionKey = `${key(identity)}\0${actionId}`;
+    const previous = this.createdByAction.get(actionKey);
+    if (previous) return cloneEvent(previous);
+    const event: CalendarEvent = {
+      id: `mock-event-${actionId}`, title: input.title, startTime: input.startTime, endTime: input.endTime,
+      status: "SCHEDULED", attendees: [...input.attendees],
+      ...(input.description === undefined ? {} : { description: input.description }),
+      ...(input.location === undefined ? {} : { location: input.location })
+    };
+    const scopedKey = key(identity);
+    this.events.set(scopedKey, [...(this.events.get(scopedKey) ?? []), event]);
+    this.createdByAction.set(actionKey, event);
+    return cloneEvent(event);
   }
 }
 
@@ -98,6 +116,37 @@ export class GoogleCalendarProvider implements CalendarProvider {
   async connectionStatus(identity: CalendarIdentity): Promise<{ connected: boolean; reauthorizationRequired?: boolean }> {
     const connection = await this.repository.get(identity.workspaceId, identity.userId);
     return connection ? { connected: true, ...(this.reauthorizationRequired.has(key(identity)) ? { reauthorizationRequired: true } : {}) } : { connected: false };
+  }
+
+  async createEvent(identity: CalendarIdentity, event: CalendarEventInput, _actionId: string): Promise<CalendarEvent> {
+    const token = await this.accessToken(identity);
+    const query = new URLSearchParams({ sendUpdates: event.attendees.length ? "all" : "none" });
+    const body = {
+      summary: event.title,
+      start: { dateTime: event.startTime },
+      end: { dateTime: event.endTime },
+      attendees: event.attendees.map((email) => ({ email })),
+      ...(event.description ? { description: event.description } : {}),
+      ...(event.location ? { location: event.location } : {})
+    };
+    let response: Response;
+    try {
+      response = await this.request(`https://www.googleapis.com/calendar/v3/calendars/primary/events?${query}`, {
+        method: "POST", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" }, body: JSON.stringify(body)
+      });
+    } catch { throw new CalendarProviderError("CALENDAR_UNAVAILABLE", "Google Calendar event creation could not reach Google.", 503); }
+    if (!response.ok) throw this.recordAuthError(identity, await this.googleError(response));
+    const resource = await response.json() as GoogleEventResource;
+    const created = mapEvent(resource);
+    if (!created || created.status !== "SCHEDULED" || created.title !== event.title || created.startTime !== new Date(event.startTime).toISOString() || created.endTime !== new Date(event.endTime).toISOString()) {
+      throw new CalendarProviderError("CALENDAR_CREATE_UNVERIFIED", "Google returned an event that did not verify the requested event details.", 502);
+    }
+    const requestedAttendees = event.attendees.map((email) => email.toLocaleLowerCase("en-US")).sort();
+    const actualAttendees = created.attendees.map((email) => email.toLocaleLowerCase("en-US")).sort();
+    if (JSON.stringify(requestedAttendees) !== JSON.stringify(actualAttendees)) {
+      throw new CalendarProviderError("CALENDAR_CREATE_UNVERIFIED", "Google returned an event with attendees that did not match the requested event.", 502);
+    }
+    return created;
   }
 
   private async listEvents(identity: CalendarIdentity, params: Record<string, string>): Promise<GoogleEventResource[]> {
@@ -161,7 +210,7 @@ export class GoogleCalendarProvider implements CalendarProvider {
       if (response.status === 429 || reason?.toLowerCase().includes("ratelimit") || reason?.toLowerCase().includes("quota")) {
         return new CalendarProviderError("CALENDAR_RATE_LIMITED", "Google Calendar is rate limited. Try again later.", 429);
       }
-      return new CalendarProviderError("CALENDAR_API_ERROR", "Google Calendar denied this read request.", 403);
+      return new CalendarProviderError("CALENDAR_API_ERROR", "Google Calendar denied this request.", 403);
     }
     return new CalendarProviderError("CALENDAR_API_ERROR", body.error?.message ?? "Google Calendar request failed.", response.status || 502);
   }
