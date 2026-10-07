@@ -1,9 +1,7 @@
-import { randomUUID } from "node:crypto";
 import { Request, Response } from "express";
 import { AuthenticatedRequest } from "../middleware/auth.js";
 import { resolveWorkspaceScope } from "../middleware/workspace.js";
 import { GoogleCalendarOAuthError, googleCalendarOAuthService } from "../integrations/googleCalendar/googleCalendarOAuthService.js";
-import { CalendarTool } from "../tools/calendarTool.js";
 
 function owner(req: AuthenticatedRequest, res: Response): { workspaceId: string; userId: string; orgId: string } | undefined {
   const { userId, orgId } = req.user ?? {};
@@ -49,10 +47,8 @@ export const googleCalendarStatus = async (req: AuthenticatedRequest, res: Respo
   if (!identity) return;
   try {
     const status = await googleCalendarOAuthService.status(identity);
-    const providerStatus = await CalendarTool.connectionStatus({ goalId: "calendar-status", runId: "calendar-status", actionId: "calendar-status", userId: identity.userId, orgId: identity.workspaceId });
     res.json({ success: true,
-      status: !status.connected ? "disconnected" : providerStatus.reauthorizationRequired ? "reauthorization_required" : "connected",
-      connectedAt: status.connectedAt
+      status: !status.connected ? "disconnected" : status.reauthorizationRequired ? "reauthorization_required" : status.accessDenied ? "access_denied" : status.unavailable ? "unavailable" : "connected"
     });
   } catch (error) { errorResponse(res, error); }
 };
@@ -64,22 +60,4 @@ export const disconnectGoogleCalendar = async (req: AuthenticatedRequest, res: R
     await googleCalendarOAuthService.disconnect(identity);
     res.json({ success: true, status: "disconnected" });
   } catch (error) { errorResponse(res, error); }
-};
-
-export const upcomingCalendarEvents = async (req: AuthenticatedRequest, res: Response): Promise<void> => {
-  const identity = owner(req, res);
-  if (!identity) return;
-  const from = typeof req.query.from === "string" ? req.query.from : new Date().toISOString();
-  const until = typeof req.query.until === "string" ? req.query.until : undefined;
-  const context = { goalId: "calendar-activity", runId: `calendar-${randomUUID()}`, actionId: `calendar-${randomUUID()}`,
-    userId: identity.userId, orgId: identity.workspaceId };
-  const result = await CalendarTool.listUpcomingEvents({ from, ...(until ? { until } : {}) }, context);
-  if (!result.success) {
-    const status = result.error.code === "CALENDAR_NOT_CONNECTED" ? 409
-      : result.error.code === "CALENDAR_AUTH_EXPIRED" ? 401
-      : result.error.code === "CALENDAR_RATE_LIMITED" ? 429 : 503;
-    res.status(status).json({ success: false, error: result.error });
-    return;
-  }
-  res.json({ success: true, data: result.data });
 };

@@ -71,6 +71,27 @@ describe("controlled investigation orchestration", () => {
     assert.equal(result.status, "completed");
   });
 
+  it("uses a bounded Gmail query for recent unanswered-message prompts", async () => {
+    const plan = planBusinessGoal(goal("Find recent emails from clients that haven't received a reply."));
+    assert.deepEqual(plan.initialCalls.map(({ tool, action }) => `${tool}.${action}`), ["email.getUnansweredMessages"]);
+    assert.equal(plan.initialCalls[0]?.params.query, "newer_than:30d");
+  });
+
+  it("queries Gmail content only for message-content questions and Calendar only for date-relevant prompts", () => {
+    const emailPlan = planBusinessGoal(goal("What did the client say about the project deadline?"));
+    assert.deepEqual(emailPlan.initialCalls.map(({ tool, action }) => `${tool}.${action}`), ["email.getEmailContent"]);
+    assert.match(String(emailPlan.initialCalls[0]?.params.query), /deadline/);
+    assert.equal(emailPlan.initialCalls[0]?.params.limit, 5);
+
+    const calendarPlan = planBusinessGoal(goal("What meetings do I have tomorrow?"));
+    assert.deepEqual(calendarPlan.initialCalls.map(({ tool, action }) => `${tool}.${action}`), ["calendar.listUpcomingEvents"]);
+    const { from, until } = calendarPlan.initialCalls[0]!.params;
+    assert.equal(Date.parse(String(until)) - Date.parse(String(from)), 24 * 60 * 60 * 1000);
+
+    const irrelevantPlan = planBusinessGoal(goal("Find my inactive high-value leads."));
+    assert.equal(irrelevantPlan.initialCalls.some(({ tool }) => tool === "email" || tool === "calendar"), false);
+  });
+
   it("calls calendar only when requested, and only after matching CRM candidates exist", async () => {
     const calls: Array<{ label: string; params: Record<string, unknown> }> = [];
     const orchestrator = new ControlledAgentOrchestrator(async (call) => {
@@ -79,7 +100,7 @@ describe("controlled investigation orchestration", () => {
     });
     const result = await orchestrator.run(goal("Find inactive high-value leads and check calendar availability for 2026-10-02 for 30 minutes"), context);
     assert.deepEqual(calls.map(({ label }) => label), ["crm.listInactiveLeads", "calendar.getAvailability"]);
-    assert.deepEqual(calls[1]!.params, { date: "2026-10-02T00:00:00.000Z", durationMinutes: 30, attendeeEmails: ["candidate@example.test"] });
+    assert.deepEqual(calls[1]!.params, { from: "2026-10-02T00:00:00.000Z", until: "2026-10-03T00:00:00.000Z", durationMinutes: 30 });
     assert.equal(result.status, "completed");
   });
 

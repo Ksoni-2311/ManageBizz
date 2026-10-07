@@ -22,7 +22,7 @@ export const ToolsRegistry = {
 /** Explicit capability lists keep read-only queries separate from mutations. */
 export const READ_ONLY_TOOL_ACTIONS: Readonly<Record<string, readonly string[]>> = {
   crm: ["listActiveHighValueLeads", "listInactiveLeads", "searchLeads"],
-  email: ["getEmailHistory", "getUnansweredMessages", "getEmailMetadata"],
+  email: ["getEmailHistory", "getUnansweredMessages", "getEmailMetadata", "getEmailContent"],
   calendar: ["getAvailability", "getMeeting", "listUpcomingEvents", "findEventsForLead"],
   analytics: ["getLeadMetrics", "getConversionMetrics", "getSalesMetrics", "getActivityMetrics"],
   tasks: ["listOpenTasks"]

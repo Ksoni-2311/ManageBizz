@@ -5,12 +5,12 @@ import { CalendarProvider, CalendarEvent, GoogleCalendarProvider, MockCalendarPr
 import { emailAddress, nonEmpty, requireApprovedAction, runValidated, ToolDomainError } from "./contract.js";
 
 const availabilitySchema = z.object({
-  date: z.string().datetime().optional(), durationMinutes: z.number().int().positive().optional(),
-  attendeeEmails: z.array(emailAddress).max(500).optional()
+  from: z.string().datetime().optional(), until: z.string().datetime().optional(),
+  durationMinutes: z.number().int().positive().max(1440).optional()
 }).strict();
 const meetingLookupSchema = z.object({ meetingId: nonEmpty }).strict();
 const leadLookupSchema = z.object({ leadEmail: emailAddress }).strict();
-const upcomingSchema = z.object({ from: z.string().datetime().optional(), until: z.string().datetime().optional() }).strict()
+const upcomingSchema = z.object({ from: z.string().datetime().optional(), until: z.string().datetime().optional(), queryTerm: z.string().trim().min(1).max(60).optional() }).strict()
   .refine(({ from, until }) => !from || !until || Date.parse(until) > Date.parse(from), { path: ["until"], message: "until must be later than from" });
 const createMeetingSchema = z.object({
   title: nonEmpty.max(300),
@@ -37,13 +37,17 @@ export class CalendarToolService {
     this.service = new CalendarService(this.provider);
   }
 
-  getAvailability(params: unknown, context: ToolExecutionContext): Promise<ToolResponse<[]>> {
-    return runValidated(availabilitySchema, params, context, async () => {
-      // Free/busy and event writes are intentionally outside the initial read-only integration scope.
+  getAvailability(params: unknown, context: ToolExecutionContext): Promise<ToolResponse<Array<{ startTime: string; endTime: string }>>> {
+    return runValidated(availabilitySchema, params, context, async ({ from, until }) => {
       if (this.provider instanceof MockCalendarProvider) return [];
+      const start = from ?? this.clock().toISOString();
+      const end = until ?? new Date(Date.parse(start) + 7 * 24 * 60 * 60 * 1000).toISOString();
+      if (Date.parse(end) <= Date.parse(start) || Date.parse(end) - Date.parse(start) > 31 * 24 * 60 * 60 * 1000) {
+        throw new ToolDomainError("INVALID_INPUT", "Calendar availability must use a valid range no longer than 31 days.");
+      }
       const status = await this.calendarCall(() => this.service.connectionStatus(identity(context)));
       if (!status.connected) throw new ToolDomainError("CALENDAR_NOT_CONNECTED", "Google Calendar is not connected for this workspace.");
-      throw new ToolDomainError("CALENDAR_CAPABILITY_UNAVAILABLE", "Calendar availability search is not enabled; only event reads are available.");
+      return this.calendarCall(() => this.provider.listBusyPeriods(identity(context), { from: start, until: end }));
     });
   }
 
@@ -56,9 +60,9 @@ export class CalendarToolService {
   }
 
   listUpcomingEvents(params: unknown, context: ToolExecutionContext): Promise<ToolResponse<Meeting[]>> {
-    return runValidated(upcomingSchema, params, context, async ({ from, until }) => {
+    return runValidated(upcomingSchema, params, context, async ({ from, until, queryTerm }) => {
       const events = await this.calendarCall(() => this.service.listUpcomingEvents(identity(context), {
-        from: from ?? this.clock().toISOString(), ...(until ? { until } : {})
+        from: from ?? this.clock().toISOString(), ...(until ? { until } : {}), ...(queryTerm ? { queryTerm } : {})
       }));
       return events.map(cloneEvent);
     });

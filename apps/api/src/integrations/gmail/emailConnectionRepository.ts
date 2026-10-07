@@ -2,7 +2,8 @@ import { createHash, randomUUID } from "node:crypto";
 import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 
-export type EmailConnection = { workspaceId: string; userId: string; encryptedRefreshToken: string; connectedAt: string };
+export type EmailConnectionHealth = "verified" | "reauthorization_required" | "access_denied" | "unavailable";
+export type EmailConnection = { workspaceId: string; userId: string; encryptedRefreshToken: string; connectedAt: string; tokenVersion?: string; health?: EmailConnectionHealth };
 export interface EmailConnectionRepository {
   get(workspaceId: string, userId: string): Promise<EmailConnection | undefined>;
   save(connection: EmailConnection): Promise<void>;

@@ -2,6 +2,7 @@ import { createHash, randomBytes } from "node:crypto";
 import { EmailConnectionRepository, emailConnectionRepository } from "./emailConnectionRepository.js";
 import { assertGoogleTokenEncryptionKey, encryptGoogleRefreshToken, decryptGoogleRefreshToken } from "../googleOAuth/tokenEncryption.js";
 import { GoogleProviderError } from "../googleOAuth/googleProviderError.js";
+import { gmailApiError, healthForGmailError } from "./gmailApiError.js";
 
 const SCOPES = ["https://www.googleapis.com/auth/gmail.readonly", "https://www.googleapis.com/auth/gmail.compose"];
 type Owner = { workspaceId: string; userId: string };
@@ -24,12 +25,47 @@ export class GmailOAuthService {
     let response: Response;
     try { response = await this.request("https://oauth2.googleapis.com/token", { method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" }, body: new URLSearchParams({ code, client_id: clientId, client_secret: clientSecret, redirect_uri: redirectUri, grant_type: "authorization_code", code_verifier: pending.verifier }) }); }
     catch { throw new GoogleProviderError("OAUTH_UNAVAILABLE", "Google authorization service could not be reached.", 503); }
-    const tokens = await response.json().catch(() => ({})) as { refresh_token?: string };
-    if (!response.ok || !tokens.refresh_token) throw new GoogleProviderError("OAUTH_TOKEN_EXCHANGE_FAILED", "Google did not provide a refresh token. Retry connecting and approve offline access.", 502);
-    await this.repository.save({ workspaceId: pending.workspaceId, userId: pending.userId, encryptedRefreshToken: encryptGoogleRefreshToken(tokens.refresh_token), connectedAt: new Date(this.now()).toISOString() });
+    const tokens = await response.json().catch(() => ({})) as { access_token?: string; refresh_token?: string };
+    if (!response.ok || !tokens.access_token) throw new GoogleProviderError("OAUTH_TOKEN_EXCHANGE_FAILED", "Google did not provide an access token for Gmail verification.", 502);
+    const existing = await this.repository.get(pending.workspaceId, pending.userId);
+    const encryptedRefreshToken = tokens.refresh_token
+      ? encryptGoogleRefreshToken(tokens.refresh_token)
+      : existing?.encryptedRefreshToken;
+    if (!encryptedRefreshToken) throw new GoogleProviderError("OAUTH_TOKEN_EXCHANGE_FAILED", "Google did not provide a refresh token. Retry connecting and approve offline access.", 502);
+
+    try {
+      const verification = await this.request("https://gmail.googleapis.com/gmail/v1/users/me/profile", {
+        headers: { Authorization: `Bearer ${tokens.access_token}` }
+      });
+      if (!verification.ok) throw await gmailApiError(verification);
+    } catch (error) {
+      const providerError = error instanceof GoogleProviderError
+        ? error
+        : new GoogleProviderError("EMAIL_UNAVAILABLE", "Gmail access could not be verified because Google could not be reached.", 503);
+      if (existing) {
+        await this.repository.save({ ...existing, health: healthForGmailError(providerError.code) });
+      }
+      throw providerError;
+    }
+
+    await this.repository.save({
+      workspaceId: pending.workspaceId,
+      userId: pending.userId,
+      encryptedRefreshToken,
+      connectedAt: new Date(this.now()).toISOString(),
+      tokenVersion: randomBytes(16).toString("hex"),
+      health: "verified"
+    });
     return { workspaceId: pending.workspaceId, userId: pending.userId };
   }
-  async status(owner: Owner) { const value = await this.repository.get(owner.workspaceId, owner.userId); return value ? { connected: true, connectedAt: value.connectedAt } : { connected: false }; }
+  async connectionStatus(owner: Owner) {
+    const connection = await this.repository.get(owner.workspaceId, owner.userId);
+    if (!connection) return { connected: false as const };
+    if (connection.health === "verified") return { connected: true as const };
+    if (connection.health === "reauthorization_required") return { connected: true as const, reauthorizationRequired: true };
+    if (connection.health === "access_denied") return { connected: true as const, accessDenied: true };
+    return { connected: true as const, unavailable: true };
+  }
   async disconnect(owner: Owner) {
     const connection = await this.repository.get(owner.workspaceId, owner.userId); await this.repository.delete(owner.workspaceId, owner.userId); if (!connection) return;
     try {

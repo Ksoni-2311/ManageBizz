@@ -69,8 +69,10 @@ describe("Google Calendar provider architecture", () => {
       if (!expiredResult.success) assert.equal(expiredResult.error.code, "CALENDAR_AUTH_EXPIRED");
       assert.equal((await expired.connectionStatus(identity)).reauthorizationRequired, true);
 
+      const rateLimitRepository = new InMemoryCalendarConnectionRepository();
+      await rateLimitRepository.save({ ...identity, encryptedRefreshToken: encryptRefreshToken("refresh-token"), connectedAt: new Date().toISOString() });
       let requestCount = 0;
-      const rateLimited = new GoogleCalendarProvider(repository, async () => {
+      const rateLimited = new GoogleCalendarProvider(rateLimitRepository, async () => {
         requestCount += 1;
         return requestCount === 1
           ? new Response(JSON.stringify({ access_token: "access", expires_in: 3600 }), { status: 200 })
@@ -113,9 +115,12 @@ describe("Google Calendar provider architecture", () => {
     }, async () => {
       const repository = new InMemoryCalendarConnectionRepository();
       const fetcher: typeof fetch = async (input, init) => {
-        assert.equal(String(input), "https://oauth2.googleapis.com/token");
-        assert.equal(init?.method, "POST");
-        return new Response(JSON.stringify({ access_token: "temporary-access", refresh_token: "long-lived-refresh" }), { status: 200 });
+        if (String(input) === "https://oauth2.googleapis.com/token") {
+          assert.equal(init?.method, "POST");
+          return new Response(JSON.stringify({ access_token: "temporary-access", refresh_token: "long-lived-refresh" }), { status: 200 });
+        }
+        assert.equal(String(input), "https://www.googleapis.com/calendar/v3/calendars/primary");
+        return new Response(JSON.stringify({ id: "primary" }), { status: 200 });
       };
       const oauth = new GoogleCalendarOAuthService(repository, fetcher);
       const authorizationUrl = new URL(oauth.authorizationUrl(identity));

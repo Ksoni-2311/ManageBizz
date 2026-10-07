@@ -1,17 +1,20 @@
-import { EmailConnectionRepository, emailConnectionRepository } from "./emailConnectionRepository.js";
+import { EmailConnectionHealth, EmailConnectionRepository, emailConnectionRepository } from "./emailConnectionRepository.js";
 import { decryptGoogleRefreshToken } from "../googleOAuth/tokenEncryption.js";
 import { GoogleProviderError } from "../googleOAuth/googleProviderError.js";
+import { gmailApiError, healthForGmailError } from "./gmailApiError.js";
 
 export type EmailIdentity = { workspaceId: string; userId: string };
 export type ProviderEmail = { id: string; threadId?: string | undefined; leadEmail?: string | undefined; direction: "INBOUND" | "OUTBOUND"; subject?: string | undefined; sentAt?: string | undefined; inReplyToMessageId?: string | undefined; messageId?: string | undefined };
 export type EmailSearch = { leadEmail?: string | undefined; leadEmails?: string[] | undefined; query?: string | undefined };
+export type EmailContent = { id: string; threadId?: string; from?: string; to?: string; subject?: string; sentAt?: string; body: string };
 export type EmailDraftInput = { to: string; subject: string; body: string };
 export type ProviderEmailDraft = EmailDraftInput & { draftId: string; status: "DRAFT" };
 export type ProviderSentEmail = { messageId: string; draftId: string; to: string; subject: string; sentAt: string; status: "SENT" };
 export interface EmailProvider {
   search(identity: EmailIdentity, query: EmailSearch): Promise<ProviderEmail[]>;
+  searchContent(identity: EmailIdentity, query: EmailSearch, limit: number): Promise<EmailContent[]>;
   getMetadata(identity: EmailIdentity, messageId: string): Promise<ProviderEmail | undefined>;
-  connectionStatus(identity: EmailIdentity): Promise<{ connected: boolean; reauthorizationRequired?: boolean }>;
+  connectionStatus(identity: EmailIdentity): Promise<{ connected: boolean; reauthorizationRequired?: boolean; accessDenied?: boolean; unavailable?: boolean }>;
   createDraft(identity: EmailIdentity, draft: EmailDraftInput, actionId: string): Promise<ProviderEmailDraft>;
   sendDraft(identity: EmailIdentity, draftId: string, actionId: string): Promise<ProviderSentEmail>;
 }
@@ -26,6 +29,16 @@ export class MockEmailProvider implements EmailProvider {
     const values = this.values.get(key(identity)) ?? this.values.get("*\0*") ?? [];
     const addresses = query.leadEmail ? [query.leadEmail.toLowerCase()] : query.leadEmails?.map((email) => email.toLowerCase());
     return values.filter((message) => !addresses || Boolean(message.leadEmail && addresses.includes(message.leadEmail.toLowerCase()))).map((message) => ({ ...message }));
+  }
+  async searchContent(identity: EmailIdentity, query: EmailSearch, limit: number): Promise<EmailContent[]> {
+    const filtered = await this.search(identity, query);
+    return filtered.slice(0, limit).map(({ id, threadId, subject, sentAt }) => ({
+      id,
+      ...(threadId ? { threadId } : {}),
+      ...(subject ? { subject } : {}),
+      ...(sentAt ? { sentAt } : {}),
+      body: ""
+    }));
   }
   async getMetadata(identity: EmailIdentity, id: string) { const value = (this.values.get(key(identity)) ?? this.values.get("*\0*") ?? []).find((message) => message.id === id); return value ? { ...value } : undefined; }
   async connectionStatus(identity: EmailIdentity) { return { connected: this.values.has(key(identity)) }; }
@@ -51,19 +64,23 @@ export class MockEmailProvider implements EmailProvider {
   }
 }
 
-type GmailMessage = { id?: string; threadId?: string; labelIds?: string[]; internalDate?: string; payload?: { headers?: Array<{ name?: string; value?: string }> } };
+type GmailPart = { mimeType?: string; body?: { data?: string }; parts?: GmailPart[] };
+type GmailMessage = { id?: string; threadId?: string; labelIds?: string[]; internalDate?: string; payload?: GmailPart & { headers?: Array<{ name?: string; value?: string }> } };
 type GmailThread = { messages?: GmailMessage[] };
 type GmailDraftResource = { id?: string; message?: GmailMessage };
 const headersToGet = ["From", "To", "Cc", "Subject", "Date", "In-Reply-To", "References", "Message-ID"];
 
 /** Uses metadata format only; message bodies are never requested. */
 export class GmailProvider implements EmailProvider {
-  private tokens = new Map<string, { value: string; expiresAt: number }>();
-  private expired = new Set<string>();
+  private tokens = new Map<string, { value: string; expiresAt: number; tokenVersion: string }>();
   constructor(private readonly repository: EmailConnectionRepository = emailConnectionRepository, private readonly request: typeof fetch = fetch) {}
   async connectionStatus(identity: EmailIdentity) {
     const connection = await this.repository.get(identity.workspaceId, identity.userId);
-    return connection ? { connected: true, ...(this.expired.has(key(identity)) ? { reauthorizationRequired: true } : {}) } : { connected: false };
+    if (!connection) return { connected: false };
+    if (connection.health === "verified") return { connected: true };
+    if (connection.health === "access_denied") return { connected: true, accessDenied: true };
+    if (connection.health === "unavailable") return { connected: true, unavailable: true };
+    return { connected: true, reauthorizationRequired: true };
   }
   async search(identity: EmailIdentity, criteria: EmailSearch): Promise<ProviderEmail[]> {
     const q = buildQuery(criteria), token = await this.accessToken(identity), threads = new Set<string>();
@@ -84,6 +101,7 @@ export class GmailProvider implements EmailProvider {
       if (!response.ok) throw await this.apiError(identity, response);
       return (await response.json() as GmailThread).messages ?? [];
     }))).flat();
+    await this.markHealth(identity, "verified");
     const ids = new Set(messages.flatMap((message) => message.id ? [message.id] : []));
     return messages.flatMap((message) => {
       if (!message.id) return [];
@@ -94,6 +112,48 @@ export class GmailProvider implements EmailProvider {
       const reply = h.get("in-reply-to")?.replace(/[<>]/g, "").trim();
       return [{ id: message.id, ...(message.threadId ? { threadId: message.threadId } : {}), ...(leadEmail ? { leadEmail } : {}), direction: sent ? "OUTBOUND" as const : "INBOUND" as const,
         ...(h.get("subject") ? { subject: h.get("subject") } : {}), ...(date ? { sentAt: date } : {}), ...(reply && ids.has(reply) ? { inReplyToMessageId: reply } : {}), ...(h.get("message-id") ? { messageId: h.get("message-id") } : {}) }];
+    });
+  }
+  async searchContent(identity: EmailIdentity, criteria: EmailSearch, limit: number): Promise<EmailContent[]> {
+    const q = buildQuery(criteria), token = await this.accessToken(identity);
+    const query = new URLSearchParams({ q, maxResults: String(Math.min(Math.max(limit, 1), 5)) });
+    let response: Response;
+    try {
+      response = await this.request(`https://gmail.googleapis.com/gmail/v1/users/me/messages?${query}`, {
+        headers: { Authorization: `Bearer ${token}` }
+      });
+    } catch {
+      throw new GoogleProviderError("EMAIL_UNAVAILABLE", "Gmail search could not reach Google.", 503);
+    }
+    if (!response.ok) throw await this.apiError(identity, response);
+    const result = await response.json() as { messages?: Array<{ id?: string }> };
+    const contents = await Promise.all((result.messages ?? []).flatMap(({ id }) => id ? [id] : []).map(async (id) => {
+      let messageResponse: Response;
+      try {
+        messageResponse = await this.request(`https://gmail.googleapis.com/gmail/v1/users/me/messages/${encodeURIComponent(id)}?format=full`, {
+          headers: { Authorization: `Bearer ${token}` }
+        });
+      } catch {
+        throw new GoogleProviderError("EMAIL_UNAVAILABLE", "Gmail message lookup could not reach Google.", 503);
+      }
+      if (!messageResponse.ok) throw await this.apiError(identity, messageResponse);
+      return (await messageResponse.json()) as GmailMessage;
+    }));
+    await this.markHealth(identity, "verified");
+    return contents.flatMap((message) => {
+      if (!message.id) return [];
+      const headers = headerMap(message);
+      const body = extractTextBody(message.payload).slice(0, 12_000);
+      const from = headers.get("from"), to = headers.get("to"), subject = headers.get("subject");
+      return [{
+        id: message.id,
+        ...(message.threadId ? { threadId: message.threadId } : {}),
+        ...(from ? { from } : {}),
+        ...(to ? { to } : {}),
+        ...(subject ? { subject } : {}),
+        ...(message.internalDate ? { sentAt: new Date(Number(message.internalDate)).toISOString() } : {}),
+        body
+      }];
     });
   }
   async getMetadata(identity: EmailIdentity, id: string): Promise<ProviderEmail | undefined> {
@@ -171,8 +231,11 @@ export class GmailProvider implements EmailProvider {
   private async accessToken(identity: EmailIdentity): Promise<string> {
     const id = key(identity), connection = await this.repository.get(identity.workspaceId, identity.userId);
     if (!connection) throw new GoogleProviderError("EMAIL_NOT_CONNECTED", "Gmail is not connected for this workspace.", 409);
+    if (connection.health === "reauthorization_required") throw new GoogleProviderError("EMAIL_AUTH_REQUIRED", "Gmail needs authorization again. Reconnect Gmail.", 403);
+    if (connection.health === "access_denied") throw new GoogleProviderError("EMAIL_ACCESS_DENIED", "Google denied access to this Gmail mailbox. Reconnect or review Google permissions.", 403);
     const cached = this.tokens.get(id);
-    if (!this.expired.has(id) && cached && cached.expiresAt > Date.now() + 60_000) return cached.value;
+    const tokenVersion = connection.tokenVersion ?? connection.connectedAt;
+    if (cached?.tokenVersion === tokenVersion && cached.expiresAt > Date.now() + 60_000) return cached.value;
     const clientId = process.env.GOOGLE_GMAIL_CLIENT_ID, clientSecret = process.env.GOOGLE_GMAIL_CLIENT_SECRET;
     if (!clientId || !clientSecret) throw new GoogleProviderError("EMAIL_CONFIGURATION_ERROR", "Gmail integration is not configured.", 503);
     let response: Response;
@@ -180,19 +243,30 @@ export class GmailProvider implements EmailProvider {
     catch { throw new GoogleProviderError("EMAIL_UNAVAILABLE", "Google authorization service could not be reached.", 503); }
     if (!response.ok) {
       const error = await response.json().catch(() => ({})) as { error?: string };
-      if (error.error === "invalid_grant") { this.expired.add(id); throw new GoogleProviderError("EMAIL_AUTH_EXPIRED", "Gmail authorization expired. Reconnect Gmail.", 401); }
+      if (error.error === "invalid_grant") {
+        await this.markHealth(identity, "reauthorization_required");
+        throw new GoogleProviderError("EMAIL_AUTH_EXPIRED", "Gmail authorization expired. Reconnect Gmail.", 401);
+      }
+      await this.markHealth(identity, "unavailable");
       throw new GoogleProviderError("EMAIL_AUTH_ERROR", "Gmail authorization could not be refreshed.", response.status);
     }
     const data = await response.json() as { access_token?: string; expires_in?: number };
     if (!data.access_token) throw new GoogleProviderError("EMAIL_AUTH_ERROR", "Google did not return an access token.", 502);
-    this.tokens.set(id, { value: data.access_token, expiresAt: Date.now() + (data.expires_in ?? 3600) * 1000 }); this.expired.delete(id);
+    this.tokens.set(id, { value: data.access_token, expiresAt: Date.now() + (data.expires_in ?? 3600) * 1000, tokenVersion });
     return data.access_token;
   }
   private async apiError(identity: EmailIdentity, response: Response) {
-    if (response.status === 401) { this.expired.add(key(identity)); return new GoogleProviderError("EMAIL_AUTH_EXPIRED", "Gmail authorization expired. Reconnect Gmail.", 401); }
+    const error = await gmailApiError(response);
+    if (response.status === 401 || response.status === 403) {
+      this.tokens.delete(key(identity));
+      await this.markHealth(identity, healthForGmailError(error.code));
+    }
     if (response.status === 429) return new GoogleProviderError("EMAIL_RATE_LIMITED", "Gmail is rate limited. Try again later.", 429);
-    if (response.status === 403) return new GoogleProviderError("EMAIL_API_ERROR", "Google denied this Gmail read request.", 403);
-    return new GoogleProviderError("EMAIL_API_ERROR", "Gmail request failed.", response.status || 502);
+    return error;
+  }
+  private async markHealth(identity: EmailIdentity, health: EmailConnectionHealth) {
+    const connection = await this.repository.get(identity.workspaceId, identity.userId);
+    if (connection && connection.health !== health) await this.repository.save({ ...connection, health });
   }
 }
 
@@ -205,6 +279,11 @@ function buildQuery(criteria: EmailSearch): string {
 }
 function metadataParams() { const params = new URLSearchParams({ format: "metadata" }); for (const header of headersToGet) params.append("metadataHeaders", header); return params; }
 function headerMap(message: GmailMessage) { return new Map((message.payload?.headers ?? []).flatMap(({ name, value }) => name && value ? [[name.toLowerCase(), value] as const] : [])); }
+function extractTextBody(part?: GmailPart): string {
+  if (!part) return "";
+  if (part.mimeType === "text/plain" && part.body?.data) return Buffer.from(part.body.data, "base64url").toString("utf8");
+  return (part.parts ?? []).map(extractTextBody).filter(Boolean).join("\n");
+}
 function addresses(value?: string) { return value?.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi)?.map((email) => email.toLowerCase()) ?? []; }
 function validDate(value?: string) { return value && Number.isFinite(Date.parse(value)) ? new Date(value).toISOString() : undefined; }
 function key(identity: EmailIdentity) { return `${identity.workspaceId}\0${identity.userId}`; }

@@ -36,25 +36,25 @@ export type CRMImportPreview = {
   replacesExisting: boolean;
 };
 
-export type CalendarConnectionStatus = "connected" | "disconnected" | "reauthorization_required";
-export type CalendarActivityEvent = {
-  id: string;
-  title: string;
-  attendees: string[];
-  startTime: string;
-  endTime: string;
-  status: "SCHEDULED" | "CANCELLED";
-  description?: string;
-  location?: string;
-};
-export type GmailConnectionStatus = "connected" | "disconnected" | "reauthorization_required";
-export type EmailActivityMessage = {
-  id: string; threadId?: string; leadEmail?: string; direction: "INBOUND" | "OUTBOUND";
-  subject?: string; sentAt?: string; responseStatus: "INBOUND" | "ANSWERED" | "UNANSWERED";
-};
+export type CalendarConnectionStatus = "connected" | "disconnected" | "reauthorization_required" | "access_denied" | "unavailable";
+export type GmailConnectionStatus = "connected" | "disconnected" | "reauthorization_required" | "access_denied" | "unavailable";
 
 export class ManageBizzApiError extends Error {
   constructor(message: string, readonly code?: string, readonly details?: unknown) { super(message); }
+}
+
+export function gmailStatusAfterApiError(code?: string): GmailConnectionStatus {
+  if (code === "EMAIL_NOT_CONNECTED") return "disconnected";
+  if (code === "EMAIL_AUTH_EXPIRED" || code === "EMAIL_AUTH_REQUIRED") return "reauthorization_required";
+  if (code === "EMAIL_ACCESS_DENIED") return "access_denied";
+  return "unavailable";
+}
+
+export function calendarStatusAfterApiError(code?: string): CalendarConnectionStatus {
+  if (code === "CALENDAR_NOT_CONNECTED") return "disconnected";
+  if (code === "CALENDAR_AUTH_EXPIRED" || code === "CALENDAR_AUTH_REQUIRED") return "reauthorization_required";
+  if (code === "CALENDAR_ACCESS_DENIED") return "access_denied";
+  return "unavailable";
 }
 
 export type TraceEvent = {
@@ -104,6 +104,14 @@ export type AgentRun = {
   runId: string;
   status: RunStatus;
   answer: string;
+  response?: {
+    summary: string;
+    facts: EvidenceFact[];
+    inferences: string[];
+    recommendations: Array<{ statement: string; evidenceRefs: string[] }>;
+    evidenceInsufficient: boolean;
+  };
+  plan?: { objective: string; factsRequired: string[]; steps: Array<{ tool: string; action: string; purpose: string; dependsOnCRMResults: boolean }> };
   evidence: { facts: EvidenceFact[]; inferences: string[]; evidenceInsufficient: boolean };
   recommendations: Array<{ statement: string; evidenceRefs: string[] }>;
   actions: ActionProposal[];
@@ -159,12 +167,8 @@ export function getCRMStatus(): Promise<{ crm: CRMCurrentStatus }> {
   return request<{ crm: CRMCurrentStatus }>("/api/crm/current");
 }
 
-export function getGoogleCalendarStatus(): Promise<{ status: CalendarConnectionStatus; connectedAt?: string }> {
+export function getGoogleCalendarStatus(): Promise<{ status: CalendarConnectionStatus }> {
   return request("/api/integrations/google-calendar/status");
-}
-
-export function getUpcomingCalendarActivity(): Promise<{ data: CalendarActivityEvent[] }> {
-  return request("/api/calendar/events/upcoming");
 }
 
 export function getGoogleCalendarAuthorizationUrl(): Promise<{ authorizationUrl: string }> {
@@ -175,11 +179,8 @@ export function disconnectGoogleCalendar(): Promise<{ status: "disconnected" }> 
   return request("/api/integrations/google-calendar", { method: "DELETE" });
 }
 
-export function getGmailStatus(): Promise<{ status: GmailConnectionStatus; connectedAt?: string }> {
+export function getGmailStatus(): Promise<{ status: GmailConnectionStatus }> {
   return request("/api/integrations/gmail/status");
-}
-export function getEmailActivity(): Promise<{ data: EmailActivityMessage[] }> {
-  return request("/api/email/activity");
 }
 export function getGmailAuthorizationUrl(): Promise<{ authorizationUrl: string }> {
   return request("/api/integrations/gmail/connect");

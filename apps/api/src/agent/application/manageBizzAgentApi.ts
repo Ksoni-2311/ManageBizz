@@ -3,7 +3,7 @@ import { ParsedGoal, ToolExecutionContext, ToolResponse } from "@nexusops/shared
 import { ToolOrchestrator, ACTION_TOOL_ACTIONS } from "../../tools/index.js";
 import { buildEvidenceReport, ToolObservation } from "../policies/dataIntegrity.js";
 import { ApprovalActionWorkflow, ActionProposal } from "../runtime/approvalWorkflow.js";
-import { ControlledAgentOrchestrator, PlannedToolCall, planBusinessGoal } from "../runtime/controlledOrchestrator.js";
+import { ControlledAgentOrchestrator, type InvestigationPlan, type PlannedToolCall, planBusinessGoal } from "../runtime/controlledOrchestrator.js";
 import { RunTraceRecord, RunTraceStore, runTraceStore } from "../runtime/runTrace.js";
 import { getLLMProvider } from "../llm/unifiedLLM.js";
 
@@ -12,6 +12,14 @@ export type ManageBizzRunResult = {
   runId: string;
   status: ManageBizzRunStatus;
   answer: string;
+  response: {
+    summary: string;
+    facts: AgentEvidenceFact[];
+    inferences: string[];
+    recommendations: Array<{ statement: string; evidenceRefs: string[] }>;
+    evidenceInsufficient: boolean;
+  };
+  plan: { objective: string; factsRequired: string[]; steps: Array<{ tool: string; action: string; purpose: string; dependsOnCRMResults: boolean }> };
   evidence: { facts: AgentEvidenceFact[]; inferences: string[]; evidenceInsufficient: boolean };
   recommendations: Array<{ statement: string; evidenceRefs: string[] }>;
   actions: ActionProposal[];
@@ -22,6 +30,7 @@ type AgentEvidenceFact = ReturnType<typeof buildEvidenceReport>["FACT"][number];
 export type ManageBizzRunInput = { goal: string; orgId: string; userId: string };
 type GoalParser = {
   parseGoal(goal: string): Promise<ParsedGoal>;
+  planGoal?(goal: ParsedGoal, fallbackPlan: InvestigationPlan): Promise<InvestigationPlan>;
   generateResponse?(goal: string, observations: readonly ToolObservation[], evidenceReport: string): Promise<string>;
 };
 type Session = {
@@ -29,6 +38,7 @@ type Session = {
   userId: string;
   workflow: ApprovalActionWorkflow;
   observations: ToolObservation[];
+  plan?: InvestigationPlan;
   completion: Promise<ManageBizzRunResult>;
   proposalReady: Promise<ActionProposal>;
   proposalCount: number;
@@ -81,10 +91,14 @@ export class ManageBizzAgentApi {
     const complete = async (): Promise<ManageBizzRunResult> => {
       try {
         const parsedGoal = await this.parser.parseGoal(goal);
-        const plan = planBusinessGoal(parsedGoal);
+        const fallbackPlan = planBusinessGoal(parsedGoal);
+        const plan = this.parser.planGoal ? await this.parser.planGoal(parsedGoal, fallbackPlan) : fallbackPlan;
+        session.plan = plan;
         this.traces.append(runId, "PLAN_CREATED", {
           resultStatus: "SUCCESS",
-          details: { steps: plan.initialCalls.map(({ tool, action }) => ({ tool, action })) }
+          details: {
+            ...toUiPlan(plan)
+          }
         });
         const orchestrator = new ControlledAgentOrchestrator(async (call, context) => {
           const result = await this.executePlannedCall(call, context, workflow);
@@ -95,18 +109,20 @@ export class ManageBizzAgentApi {
         const answer = run.status === "completed" && this.parser.generateResponse
           ? await this.parser.generateResponse(goal, observations, run.finalText)
           : run.finalText;
-        const result = this.buildResult(runId, orgId, run.status, answer, observations, workflow.list(),
+        const result = this.buildResult(runId, orgId, run.status, answer, observations, workflow.list(), plan,
           run.status === "failed" ? this.failureFor(run.error, observations) : undefined);
         this.traces.finishRun(runId, result.status === "completed" ? "COMPLETED" : "FAILED", result.error?.message);
         session.finalResult = this.withTrace(result);
+        observations.length = 0;
         return session.finalResult;
       } catch (error) {
         const message = error instanceof Error ? error.message : "Agent execution failed.";
         this.traces.finishRun(runId, "FAILED", message);
-        const result = this.buildResult(runId, orgId, "failed", "Insufficient evidence to determine the requested result.", observations, workflow.list(), {
+        const result = this.buildResult(runId, orgId, "failed", "Insufficient evidence to determine the requested result.", observations, workflow.list(), session.plan, {
           code: "AGENT_FAILURE", message
         });
         session.finalResult = this.withTrace(result);
+        observations.length = 0;
         return session.finalResult;
       }
     };
@@ -117,7 +133,7 @@ export class ManageBizzAgentApi {
       session.completion.then((result) => ({ kind: "result" as const, result }))
     ]);
     if (first.kind === "result") return first.result;
-    return this.buildResult(runId, orgId, "awaiting_approval", "An action has been proposed and is awaiting approval.", observations, workflow.list());
+    return this.buildResult(runId, orgId, "awaiting_approval", "An action has been proposed and is awaiting approval.", observations, workflow.list(), session.plan);
   }
 
   async getRun(runId: string, orgId: string, userId: string): Promise<ManageBizzRunResult | undefined> {
@@ -127,7 +143,7 @@ export class ManageBizzAgentApi {
     const pending = session.workflow.list().some(({ lifecycle }) => lifecycle === "PROPOSED");
     return this.buildResult(runId, orgId, pending ? "awaiting_approval" : "running", pending
       ? "An action has been proposed and is awaiting approval."
-      : "The agent run is in progress.", session.observations, session.workflow.list());
+      : "The agent run is in progress.", session.observations, session.workflow.list(), session.plan);
   }
 
   async decideAction(
@@ -149,7 +165,7 @@ export class ManageBizzAgentApi {
       waitForProposalAfter(session, priorProposalCount).then(() => ({ kind: "proposal" as const }))
     ]);
     if (next.kind === "complete") return next.result;
-    return this.buildResult(runId, orgId, "awaiting_approval", "The previous action was processed. The next proposed action is awaiting approval.", session.observations, session.workflow.list());
+    return this.buildResult(runId, orgId, "awaiting_approval", "The previous action was processed. The next proposed action is awaiting approval.", session.observations, session.workflow.list(), session.plan);
   }
 
   private async executePlannedCall(call: PlannedToolCall, context: ToolExecutionContext, workflow: ApprovalActionWorkflow): Promise<ToolResponse> {
@@ -203,12 +219,22 @@ export class ManageBizzAgentApi {
     answer: string,
     observations: readonly ToolObservation[],
     actions: ActionProposal[],
+    plan?: InvestigationPlan,
     error?: { code: string; message: string }
   ): ManageBizzRunResult {
     const report = buildEvidenceReport(observations);
     const trace = this.traces.getRunTrace(runId, orgId)!;
+    const summary = structuredSummary(answer, observations);
     return {
-      runId, status, answer,
+      runId, status, answer: summary,
+      response: {
+        summary,
+        facts: report.FACT,
+        inferences: report.INFERENCE,
+        recommendations: report.recommendationEvidence,
+        evidenceInsufficient: report.evidenceInsufficient
+      },
+      plan: toUiPlan(plan),
       evidence: { facts: report.FACT, inferences: report.INFERENCE, evidenceInsufficient: report.evidenceInsufficient },
       recommendations: report.recommendationEvidence,
       actions,
@@ -220,6 +246,37 @@ export class ManageBizzAgentApi {
   private withTrace(result: ManageBizzRunResult): ManageBizzRunResult {
     return { ...result, trace: this.traces.getRunTrace(result.runId, result.trace.orgId) ?? result.trace };
   }
+}
+
+function toUiPlan(plan?: InvestigationPlan): ManageBizzRunResult["plan"] {
+  if (!plan) return { objective: "", factsRequired: [], steps: [] };
+  const steps: Array<PlannedToolCall & { dependsOnCRMResults: boolean }> = [
+    ...plan.initialCalls.map((call) => ({ ...call, dependsOnCRMResults: false })),
+    ...(plan.dependentCalls ?? []).map((call) => ({ ...call, dependsOnCRMResults: true }))
+  ];
+  const downstream = plan.downstream;
+  if (downstream.emailHistoryForCandidates) steps.push({ tool: "email", action: downstream.emailAction, params: {}, purpose: "Inspect email history for CRM-matched candidates.", dependsOnCRMResults: true });
+  if (downstream.calendarAvailabilityForCandidates) steps.push({ tool: "calendar", action: "getAvailability", params: {}, purpose: "Check availability for CRM-matched candidates.", dependsOnCRMResults: true });
+  if (downstream.createFollowUpTasksForCandidates) steps.push({ tool: "tasks", action: "createTask", params: {}, purpose: "Propose follow-up tasks for CRM-matched candidates; approval is required.", dependsOnCRMResults: true });
+  if (downstream.sendFollowUpForCandidates) {
+    steps.push({ tool: "email", action: "draftEmail", params: {}, purpose: "Prepare follow-up drafts for CRM-matched candidates; approval is required.", dependsOnCRMResults: true });
+    steps.push({ tool: "email", action: "sendEmail", params: {}, purpose: "Send approved follow-up drafts and verify the result.", dependsOnCRMResults: true });
+  }
+  return {
+    objective: plan.objective,
+    factsRequired: plan.factsRequired,
+    steps: steps.map(({ tool, action, purpose, dependsOnCRMResults }) => ({ tool, action, purpose, dependsOnCRMResults }))
+  };
+}
+
+function structuredSummary(answer: string, observations: readonly ToolObservation[]): string {
+  const first = answer.split("\n").map((line) => line.trim()).find((line) => line && !/^(INFERENCE|RECOMMENDATION):/i.test(line));
+  if (!first) return "Insufficient evidence to determine the requested result.";
+  // Deterministic evidence reports list every matching record in answer. Keep
+  // the overview concise; the structured evidence panel contains the records.
+  if (/^FACT:\s*CRM returned \d+ matching/i.test(first)) return first.replace(/^FACT:\s*/, "").replace(/\s*\[evidence:.*$/, "");
+  if (observations.length === 0 && /^FACT:/i.test(first)) return first.replace(/^FACT:\s*/, "");
+  return first.replace(/^FACT:\s*/, "");
 }
 
 function waitForProposalAfter(session: Session, previousCount: number): Promise<void> {

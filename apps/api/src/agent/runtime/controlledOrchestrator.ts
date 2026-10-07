@@ -15,6 +15,8 @@ export type InvestigationPlan = {
   factsRequired: string[];
   toolMappings: Array<{ fact: string; tool: BusinessToolName; action: string }>;
   initialCalls: PlannedToolCall[];
+  /** Read-only calls that require CRM candidates; executed serially only after CRM returns them. */
+  dependentCalls?: PlannedToolCall[];
   downstream: { emailHistoryForCandidates: boolean; emailAction: "getEmailHistory" | "getUnansweredMessages"; calendarAvailabilityForCandidates: boolean; calendarParams: Record<string, unknown>; sendFollowUpForCandidates: boolean; createFollowUpTasksForCandidates: boolean };
   finalEvidence: string[];
 };
@@ -46,13 +48,50 @@ export function parseRequestedMinimumDealValue(objective: string): number | unde
   return Number.isFinite(result) && result >= 0 ? result : undefined;
 }
 
-function calendarParams(objective: string): Record<string, unknown> {
-  const params: Record<string, unknown> = {};
-  const date = objective.match(/\b(\d{4}-\d{2}-\d{2}(?:T\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})?)?)\b/)?.[1];
-  if (date) params.date = date.includes("T") ? date : `${date}T00:00:00.000Z`;
+function calendarParams(objective: string, now = new Date()): Record<string, unknown> {
+  const day = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
+  const explicitDate = objective.match(/\b(\d{4}-\d{2}-\d{2})(?:T\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})?)?\b/)?.[1];
+  let start: Date | undefined;
+  let days = 1;
+  if (explicitDate) start = new Date(`${explicitDate}T00:00:00.000Z`);
+  else if (/\btomorrow\b/i.test(objective)) {
+    start = new Date(day); start.setUTCDate(start.getUTCDate() + 1);
+  } else if (/\btoday\b/i.test(objective)) start = day;
+  else if (/\bthis week\b/i.test(objective)) {
+    start = day;
+    days = 7;
+  }
+  const weekday = objective.match(/\b(?:before|by|on)\s+(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b/i)?.[1]?.toLocaleLowerCase("en-US");
+  if (!start && weekday) {
+    const weekdayIndex = ["sunday", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday"].indexOf(weekday);
+    const offset = (weekdayIndex - day.getUTCDay() + 7) % 7 || 7;
+    start = day;
+    days = offset + (/\b(before|by)\b/i.test(objective) ? 0 : 1);
+  }
+  if (!start) {
+    start = now;
+    days = 7;
+  }
+  const end = new Date(start);
+  end.setUTCDate(end.getUTCDate() + days);
+  const params: Record<string, unknown> = { from: start.toISOString(), until: end.toISOString() };
   const duration = objective.match(/\b(\d+)\s*(?:minutes?|mins?)\b/i)?.[1];
   if (duration) params.durationMinutes = Number(duration);
+  const searchTerm = objective.match(/\b(?:with|about|titled)\s+([a-z0-9][a-z0-9 .'-]{1,60})/i)?.[1]?.trim().split(/\s+(?:before|after|tomorrow|today|this|next|on|for)\b/i)[0]?.trim();
+  if (searchTerm && !/^(my|the|a|an|calendar)$/i.test(searchTerm)) params.queryTerm = searchTerm;
   return params;
+}
+
+function gmailQuery(objective: string): string {
+  const range = objective.match(/\b(?:last|past)\s+(\d+)\s+(day|days|week|weeks|month|months)\b/i);
+  const recent = /\b(recent|latest|new|last|past)\b/i.test(objective);
+  const rangeQuery = range
+    ? `newer_than:${Number(range[1]) * (range[2]!.toLowerCase().startsWith("week") ? 7 : range[2]!.toLowerCase().startsWith("month") ? 30 : 1)}d`
+    : recent || /\b(unanswered|unreplied|haven.t received a reply)\b/i.test(objective) ? "newer_than:30d" : "";
+  const keywords = [...new Set((objective.match(/[a-z0-9]{4,}/gi) ?? [])
+    .map((word) => word.toLocaleLowerCase("en-US"))
+    .filter((word) => !new Set(["find", "show", "recent", "latest", "email", "emails", "mail", "messages", "message", "from", "with", "that", "have", "received", "receive", "reply", "replies", "client", "clients", "about", "what", "did", "say", "said", "tell", "told", "when", "check", "please", "my", "the", "for", "has", "been", "their", "haven", "they", "who", "were", "was", "are", "is", "not"]).has(word)))];
+  return [rangeQuery, ...keywords.slice(0, 5)].filter(Boolean).join(" ");
 }
 
 function metricCall(goal: string, days: number): PlannedToolCall | undefined {
@@ -121,10 +160,10 @@ export function planBusinessGoal(parsed: ParsedGoal): InvestigationPlan {
   const createFollowUpTasksForCandidates = wantsLeadInvestigation && !taskAction &&
     matches(objective, /\b(?:create|add)\b[\s\S]{0,50}\b(?:tasks?)\b/i) &&
     matches(objective, /\b(follow[- ]?up|these leads|those leads|them)\b/i);
-  const wantsEmail = !createFollowUpTasksForCandidates && matches(intentLower, /\b(email|emails|communication|repl(?:y|ied|ies)|response|outreach|follow[- ]?up|re-engage|reengage|unanswered messages?)\b/);
+  const wantsEmail = !createFollowUpTasksForCandidates && matches(intentLower, /\b(email|emails|gmail|mailbox|communication|repl(?:y|ied|ies)|response|outreach|follow[- ]?up|re-engage|reengage|unanswered messages?|deadline|what did .+ say|mention(?:ed)?)\b/);
   const sendFollowUpForCandidates = wantsInactiveLeads && matches(objective, /^\s*(?:please\s+)?(?:follow[- ]?up with|send follow[- ]?up(?: emails?)? to|email all)\b/i);
-  const emailAction: InvestigationPlan["downstream"]["emailAction"] = matches(intentLower, /\b(unanswered|unreplied)\b/) ? "getUnansweredMessages" : "getEmailHistory";
-  const wantsCalendar = matches(intentLower, /\b(calendar|availability|schedule|scheduling|meeting|time slots?)\b/);
+  const emailAction: InvestigationPlan["downstream"]["emailAction"] = matches(intentLower, /\b(unanswered|unreplied)\b|haven.t received a reply|no reply\b/) ? "getUnansweredMessages" : "getEmailHistory";
+  const wantsCalendar = matches(intentLower, /\b(calendar|availability|schedule|scheduling|meeting|meetings|event|events|time slots?|tomorrow|today)\b/);
   const wantsTasks = matches(intentLower, /\b(open tasks?|list tasks?|show tasks?)\b/);
   const metric = metricCall(intentLower, parsed.timeWindowDays);
   const minDealValue = parseRequestedMinimumDealValue(objective) ?? DEFAULT_MIN_DEAL_VALUE;
@@ -176,21 +215,24 @@ export function planBusinessGoal(parsed: ParsedGoal): InvestigationPlan {
 
   const address = intentLower.match(/[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}/)?.[0];
   if (!wantsLeadInvestigation && wantsEmail) {
+    const requestsMessageBody = matches(intentLower, /\b(what did .+ say|what .+ say about|content|body|said about|mention(?:ed)?|deadline|what does .+ email say)\b/);
+    const action = requestsMessageBody ? "getEmailContent" : emailAction;
+    const query = gmailQuery(objective);
     const fact = address ? "Email messages for the explicitly identified address" : "Email messages matching the requested criteria";
     factsRequired.push(fact);
-    toolMappings.push({ fact, tool: "email", action: emailAction });
-    initialCalls.push({ tool: "email", action: emailAction, params: address ? { leadEmail: address } : {}, purpose: "Retrieve only messages matching the requested email criteria." });
+    toolMappings.push({ fact, tool: "email", action });
+    initialCalls.push({ tool: "email", action, params: requestsMessageBody ? { ...(address ? { leadEmail: address } : {}), query, limit: 5 } : { ...(address ? { leadEmail: address } : {}), query }, purpose: "Retrieve only Gmail messages matching the user's requested terms and time range." });
   }
 
   if (!wantsLeadInvestigation && wantsCalendar) {
-    const upcoming = matches(lower, /\b(upcoming|future)\b/);
-    const action = upcoming ? "listUpcomingEvents" : "getAvailability";
-    const fact = upcoming ? "Upcoming calendar events" : "Calendar availability matching the requested duration or date";
+    const availability = matches(lower, /\b(free|available|availability|time slots?)\b/);
+    const action = availability ? "getAvailability" : "listUpcomingEvents";
+    const fact = availability ? "Calendar busy periods matching the requested range" : "Calendar events matching the requested range";
     factsRequired.push(fact);
     toolMappings.push({ fact, tool: "calendar", action });
-    initialCalls.push({ tool: "calendar", action, params: upcoming ? {} : requestedCalendarParams, purpose: upcoming
-      ? "List stored calendar events that are upcoming according to the calendar service clock."
-      : "Check calendar availability because the user requested scheduling information." });
+    initialCalls.push({ tool: "calendar", action, params: requestedCalendarParams, purpose: availability
+      ? "Retrieve only busy time ranges for the date range needed to answer the user's calendar availability question."
+      : "Retrieve only calendar events within the date range needed to answer the user's question." });
   }
 
   const downstream = {
@@ -226,7 +268,7 @@ export function planBusinessGoal(parsed: ParsedGoal): InvestigationPlan {
 
 function finalText(plan: InvestigationPlan, observations: readonly ToolObservation[], error?: string): string {
   const crmObservation = observations.find(({ tool, action }) => tool === "crm" && ["listInactiveLeads", "listActiveHighValueLeads", "searchLeads"].includes(action));
-  if (crmObservation?.result.success && Array.isArray(crmObservation.result.data) && crmObservation.result.data.length === 0) {
+  if (crmObservation?.result.success && Array.isArray(crmObservation.result.data) && crmObservation.result.data.length === 0 && observations.length === 1) {
     const evidenceRef = `crm.${crmObservation.action}#${observations.indexOf(crmObservation) + 1}`;
     if (plan.downstream.createFollowUpTasksForCandidates) {
       return `FACT: No matching leads were found [evidence: ${evidenceRef}].\nRECOMMENDATION: No matching leads were found, so there are no follow-up actions to create.`;
@@ -394,7 +436,9 @@ export class ControlledAgentOrchestrator {
           stopError = `${call.tool}.${call.action} returned an invalid record collection`;
           break;
         }
-        if (result.data.length === 0) break;
+        // An empty CRM result blocks candidate-dependent lookups, but does not
+        // cancel other independent requests the user explicitly made.
+        if (result.data.length === 0) continue;
 
         if (plan.downstream.createFollowUpTasksForCandidates) {
           const leads = result.data.filter((value): value is { id: string; name: string } =>
@@ -460,12 +504,29 @@ export class ControlledAgentOrchestrator {
 
         if (plan.downstream.calendarAvailabilityForCandidates) {
           const calendarCall: PlannedToolCall = {
-            tool: "calendar", action: "getAvailability", params: { ...plan.downstream.calendarParams, attendeeEmails: uniqueEmails },
+            tool: "calendar", action: "getAvailability", params: plan.downstream.calendarParams,
             purpose: "Check availability only after CRM returned candidates and the user requested scheduling information."
           };
           const calendarResult = await callTool(calendarCall);
           if (!calendarResult.success) { stopError = `calendar.getAvailability returned ${calendarResult.error.code}`; break; }
         }
+
+        for (const dependentCall of plan.dependentCalls ?? []) {
+          let dependentParams = { ...dependentCall.params };
+          if (dependentCall.tool === "email" && ["getEmailHistory", "getUnansweredMessages"].includes(dependentCall.action)) {
+            dependentParams = { ...dependentParams, leadEmails: uniqueEmails };
+          } else if (dependentCall.tool === "calendar" && dependentCall.action === "findEventsForLead") {
+            for (const leadEmail of uniqueEmails) {
+              const result = await callTool({ ...dependentCall, params: { ...dependentParams, leadEmail } });
+              if (!result.success) { stopError = `calendar.findEventsForLead returned ${result.error.code}`; break; }
+            }
+            if (stopError) break;
+            continue;
+          }
+          const dependentResult = await callTool({ ...dependentCall, params: dependentParams });
+          if (!dependentResult.success) { stopError = `${dependentCall.tool}.${dependentCall.action} returned ${dependentResult.error.code}`; break; }
+        }
+        if (stopError) break;
       }
     }
 

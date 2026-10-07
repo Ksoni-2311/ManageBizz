@@ -54,20 +54,55 @@ export class GoogleCalendarOAuthService {
     } catch {
       throw new GoogleCalendarOAuthError("OAUTH_UNAVAILABLE", "Google authorization service could not be reached.", 503);
     }
-    const tokens = await response.json().catch(() => ({})) as { refresh_token?: string; error?: string };
-    if (!response.ok || !tokens.refresh_token) {
-      throw new GoogleCalendarOAuthError("OAUTH_TOKEN_EXCHANGE_FAILED", "Google did not provide a refresh token. Retry connecting and approve offline access.", 502);
+    const tokens = await response.json().catch(() => ({})) as { access_token?: string; refresh_token?: string; error?: string };
+    if (!response.ok || !tokens.access_token) throw new GoogleCalendarOAuthError("OAUTH_TOKEN_EXCHANGE_FAILED", "Google did not provide an access token to verify Calendar access.", 502);
+    const existing = await this.repository.get(pending.workspaceId, pending.userId);
+    const encryptedRefreshToken = tokens.refresh_token
+      ? encryptRefreshToken(tokens.refresh_token)
+      : existing?.encryptedRefreshToken;
+    if (!encryptedRefreshToken) throw new GoogleCalendarOAuthError("OAUTH_TOKEN_EXCHANGE_FAILED", "Google did not provide a refresh token. Retry connecting and approve offline access.", 502);
+    try {
+      const verification = await this.request("https://www.googleapis.com/calendar/v3/calendars/primary", {
+        headers: { Authorization: `Bearer ${tokens.access_token}` }
+      });
+      if (!verification.ok) {
+        const body = await verification.json().catch(() => ({})) as { error?: { status?: string; errors?: Array<{ reason?: string }> } };
+        const reasons = body.error?.errors?.map(({ reason }) => reason?.toLowerCase()) ?? [];
+        const code = verification.status === 401 ? "CALENDAR_AUTH_EXPIRED"
+          : reasons.some((reason) => reason === "insufficientpermissions" || reason === "insufficient_scope") ? "CALENDAR_AUTH_REQUIRED"
+          : verification.status === 403 && (reasons.some((reason) => reason === "forbidden" || reason === "permissiondenied" || reason === "accessdenied") || body.error?.status?.toLowerCase() === "permission_denied") ? "CALENDAR_ACCESS_DENIED"
+          : "CALENDAR_API_ERROR";
+        const message = code === "CALENDAR_AUTH_REQUIRED" ? "Google denied Calendar access because the required authorization scope is missing. Reconnect and approve the requested access."
+          : code === "CALENDAR_ACCESS_DENIED" ? "Google denied access to this calendar."
+          : code === "CALENDAR_AUTH_EXPIRED" ? "Google Calendar authorization expired. Reconnect the calendar."
+          : "Google Calendar access could not be verified.";
+        throw new GoogleCalendarOAuthError(code, message, verification.status);
+      }
+    } catch (error) {
+      const calendarError = error instanceof GoogleCalendarOAuthError
+        ? error
+        : new GoogleCalendarOAuthError("CALENDAR_UNAVAILABLE", "Calendar access could not be verified because Google could not be reached.", 503);
+      if (existing) await this.repository.save({ ...existing, health: healthForError(calendarError.code) });
+      throw calendarError;
     }
     await this.repository.save({
       workspaceId: pending.workspaceId, userId: pending.userId,
-      encryptedRefreshToken: encryptRefreshToken(tokens.refresh_token), connectedAt: new Date(this.now()).toISOString()
+      encryptedRefreshToken, connectedAt: new Date(this.now()).toISOString(),
+      tokenVersion: randomBytes(16).toString("hex"), health: "verified"
     });
     return { workspaceId: pending.workspaceId, userId: pending.userId };
   }
 
-  async status(owner: Owner): Promise<{ connected: boolean; connectedAt?: string }> {
+  async status(owner: Owner): Promise<{ connected: boolean; connectedAt?: string; reauthorizationRequired?: boolean; accessDenied?: boolean; unavailable?: boolean }> {
     const connection = await this.repository.get(owner.workspaceId, owner.userId);
-    return connection ? { connected: true, connectedAt: connection.connectedAt } : { connected: false };
+    if (!connection) return { connected: false };
+    return {
+      connected: true,
+      connectedAt: connection.connectedAt,
+      ...(connection.health === "reauthorization_required" ? { reauthorizationRequired: true } : {}),
+      ...(connection.health === "access_denied" ? { accessDenied: true } : {}),
+      ...(connection.health !== "verified" && connection.health !== "reauthorization_required" && connection.health !== "access_denied" ? { unavailable: true } : {})
+    };
   }
 
   async disconnect(owner: Owner): Promise<void> {
@@ -105,3 +140,9 @@ export class GoogleCalendarOAuthService {
 const decryptForRevoke = decryptRefreshToken;
 
 export const googleCalendarOAuthService = new GoogleCalendarOAuthService();
+
+function healthForError(code: string): "reauthorization_required" | "access_denied" | "unavailable" {
+  if (code === "CALENDAR_AUTH_EXPIRED" || code === "CALENDAR_AUTH_REQUIRED") return "reauthorization_required";
+  if (code === "CALENDAR_ACCESS_DENIED") return "access_denied";
+  return "unavailable";
+}

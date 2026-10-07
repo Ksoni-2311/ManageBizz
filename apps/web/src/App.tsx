@@ -5,9 +5,9 @@ import {
   ShieldCheck, Sparkles, X, LogOut
 } from "lucide-react";
 import type {
-  ActionProposal, AgentRun, CalendarActivityEvent, CalendarConnectionStatus, CRMCurrentStatus, CRMImportPreview, TraceEvent, EmailActivityMessage, GmailConnectionStatus, AuthenticatedUser
+  ActionProposal, AgentRun, CalendarConnectionStatus, CRMCurrentStatus, CRMImportPreview, TraceEvent, GmailConnectionStatus, AuthenticatedUser
 } from "./services/manageBizzClient.js";
-import { authenticate, checkApi, clearSession, confirmCRMImport, decideAction, disconnectGoogleCalendar, getCRMStatus, getGoogleCalendarAuthorizationUrl, getGoogleCalendarStatus, getRun, getRunTrace, getUpcomingCalendarActivity, ManageBizzApiError, previewCRMFile, restoreSession, signOut, submitGoal, disconnectGmail, getEmailActivity, getGmailAuthorizationUrl, getGmailStatus } from "./services/manageBizzClient.js";
+import { authenticate, calendarStatusAfterApiError, checkApi, clearSession, confirmCRMImport, decideAction, disconnectGoogleCalendar, getCRMStatus, getGoogleCalendarAuthorizationUrl, getGoogleCalendarStatus, getRun, getRunTrace, gmailStatusAfterApiError, ManageBizzApiError, previewCRMFile, restoreSession, signOut, submitGoal, disconnectGmail, getGmailAuthorizationUrl, getGmailStatus } from "./services/manageBizzClient.js";
 import { disconnectSocket } from "./services/api.js";
 
 const suggestions = [
@@ -109,11 +109,9 @@ export default function App() {
   const [refreshingTrace, setRefreshingTrace] = useState(false);
   const [crmStatus, setCRMStatus] = useState<CRMCurrentStatus | null>(null);
   const [calendarStatus, setCalendarStatus] = useState<CalendarConnectionStatus>("disconnected");
-  const [calendarEvents, setCalendarEvents] = useState<CalendarActivityEvent[]>([]);
   const [calendarBusy, setCalendarBusy] = useState(false);
   const [calendarError, setCalendarError] = useState<string | null>(null);
-  const [gmailStatus, setGmailStatus] = useState<GmailConnectionStatus | "unavailable">("disconnected");
-  const [emailActivity, setEmailActivity] = useState<EmailActivityMessage[]>([]);
+  const [gmailStatus, setGmailStatus] = useState<GmailConnectionStatus>("disconnected");
   const [gmailBusy, setGmailBusy] = useState(false);
   const [gmailError, setGmailError] = useState<string | null>(null);
   const [crmPreview, setCRMPreview] = useState<CRMImportPreview | null>(null);
@@ -164,18 +162,9 @@ export default function App() {
     try {
       const connection = await getGoogleCalendarStatus();
       setCalendarStatus(connection.status);
-      if (connection.status === "connected" || connection.status === "reauthorization_required") {
-        try {
-          const result = await getUpcomingCalendarActivity();
-          setCalendarEvents(result.data);
-          setCalendarError(null);
-        } catch (error) {
-          setCalendarEvents([]);
-          if (error instanceof ManageBizzApiError && error.code === "CALENDAR_AUTH_EXPIRED") setCalendarStatus("reauthorization_required");
-          setCalendarError(error instanceof Error ? error.message : "Calendar activity could not be loaded.");
-        }
-      } else setCalendarEvents([]);
+      setCalendarError(null);
     } catch (error) {
+      setCalendarStatus("unavailable");
       setCalendarError(error instanceof Error ? error.message : "Calendar connection status is unavailable.");
     }
   }, []);
@@ -184,20 +173,9 @@ export default function App() {
     try {
       const connection = await getGmailStatus();
       setGmailStatus(connection.status);
-      if (connection.status === "connected" || connection.status === "reauthorization_required") {
-        try {
-          const result = await getEmailActivity();
-          setEmailActivity(result.data);
-          setGmailError(null);
-        } catch (error) {
-          setEmailActivity([]);
-          if (error instanceof ManageBizzApiError && error.code === "EMAIL_AUTH_EXPIRED") setGmailStatus("reauthorization_required");
-          setGmailError(error instanceof Error ? error.message : "Email activity could not be loaded.");
-        }
-      } else setEmailActivity([]);
+      setGmailError(null);
     } catch (error) {
       setGmailStatus("unavailable");
-      setEmailActivity([]);
       setGmailError(error instanceof Error ? error.message : "Gmail connection status is unavailable.");
     }
   }, []);
@@ -216,6 +194,12 @@ export default function App() {
     void refreshCalendar();
     void refreshGmail();
   }, [authUser, refreshCalendar, refreshGmail]);
+
+  useEffect(() => {
+    const code = run?.error?.code;
+    if (code?.startsWith("EMAIL_")) setGmailStatus(gmailStatusAfterApiError(code));
+    if (code?.startsWith("CALENDAR_")) setCalendarStatus(calendarStatusAfterApiError(code));
+  }, [run?.error?.code]);
 
   async function handleConnectCalendar() {
     setCalendarBusy(true); setCalendarError(null);
@@ -242,14 +226,14 @@ export default function App() {
   async function handleSignOut() {
     try { await signOut(); } catch { /* Always clear the local session when signing out. */ }
     disconnectSocket(); clearSession(); setAuthUser(null); setRun(null); setCRMStatus(null); setCRMPreview(null);
-    setCalendarStatus("disconnected"); setCalendarEvents([]); setGmailStatus("disconnected"); setEmailActivity([]);
+    setCalendarStatus("disconnected"); setGmailStatus("disconnected");
   }
 
   async function handleDisconnectCalendar() {
     setCalendarBusy(true); setCalendarError(null);
     try {
       await disconnectGoogleCalendar();
-      setCalendarStatus("disconnected"); setCalendarEvents([]);
+      setCalendarStatus("disconnected");
     } catch (error) {
       setCalendarError(error instanceof Error ? error.message : "Google Calendar could not be disconnected.");
     } finally { setCalendarBusy(false); }
@@ -262,7 +246,7 @@ export default function App() {
   }
   async function handleDisconnectGmail() {
     setGmailBusy(true); setGmailError(null);
-    try { await disconnectGmail(); setGmailStatus("disconnected"); setEmailActivity([]); }
+    try { await disconnectGmail(); setGmailStatus("disconnected"); }
     catch (error) { setGmailError(error instanceof Error ? error.message : "Gmail could not be disconnected."); }
     finally { setGmailBusy(false); }
   }
@@ -410,53 +394,38 @@ export default function App() {
 
         <section className="panel gmail-panel">
           <div className="panel-title-row calendar-panel-heading">
-            <div><p className="eyebrow">READS · APPROVAL-GATED WRITES</p><h3>Gmail</h3></div>
+            <div><p className="eyebrow">AI CONTEXT</p><h3>Gmail</h3></div>
             <StatusPill status={gmailStatus} />
           </div>
           <div className="calendar-connection-row">
             <span className="calendar-icon gmail-icon"><Mail size={18} /></span>
             <div className="calendar-copy">
-              <strong>{gmailStatus === "connected" ? "Gmail connected" : gmailStatus === "reauthorization_required" ? "Reconnect required" : gmailStatus === "unavailable" ? "Gmail status unavailable" : "Gmail not connected"}</strong>
-              <span>{gmailStatus === "connected" ? "ManageBizz can inspect communication history and prepare or send proposed messages only after your approval." : gmailStatus === "reauthorization_required" ? "Google authorization expired. Reconnect Gmail to restore access." : gmailStatus === "unavailable" ? "Connection status could not be confirmed. Retry to check Gmail." : "Connect Gmail to inspect communication history and enable approved email actions."}</span>
+              <strong>{gmailStatus === "connected" ? "Connected" : gmailStatus === "reauthorization_required" ? "Reconnect required" : gmailStatus === "access_denied" ? "Access denied" : gmailStatus === "unavailable" ? "Status unavailable" : "Disconnected"}</strong>
+              <span>{gmailStatus === "connected" ? "Gmail is connected. Your AI agent can use your email context when needed." : gmailStatus === "reauthorization_required" ? "Gmail needs authorization again. Reconnect and approve the requested access." : gmailStatus === "access_denied" ? "Google denied Gmail access. Reconnect or review your Google account permissions." : gmailStatus === "unavailable" ? "Gmail access could not be verified. Retry or reconnect to check access." : "Connect Gmail to let your AI agent use your email context when needed."}</span>
             </div>
-            {gmailStatus === "unavailable"
-              ? <button className="button button-secondary" onClick={() => void refreshGmail()}><RefreshCw size={15} /> Retry status</button>
-              : gmailStatus === "disconnected" || gmailStatus === "reauthorization_required"
-              ? <button className="button button-secondary" disabled={gmailBusy || apiState !== "available"} onClick={() => void handleConnectGmail()}>{gmailBusy ? <><LoaderCircle className="spin" size={15} /> Connecting…</> : <><ExternalLink size={15} /> Connect Gmail</>}</button>
-              : <><button className="button button-secondary" disabled={gmailBusy || apiState !== "available"} onClick={() => void handleConnectGmail()}>{gmailBusy ? <><LoaderCircle className="spin" size={15} /> Reconnecting…</> : "Update Gmail access"}</button><button className="button button-secondary" disabled={gmailBusy} onClick={() => void handleDisconnectGmail()}>{gmailBusy ? <><LoaderCircle className="spin" size={15} /> Disconnecting…</> : "Disconnect"}</button></>}
+            {gmailStatus === "connected"
+              ? <><button className="button button-secondary" disabled={gmailBusy || apiState !== "available"} onClick={() => void handleConnectGmail()}>{gmailBusy ? <><LoaderCircle className="spin" size={15} /> Reconnecting…</> : "Update Gmail access"}</button><button className="button button-secondary" disabled={gmailBusy} onClick={() => void handleDisconnectGmail()}>{gmailBusy ? <><LoaderCircle className="spin" size={15} /> Disconnecting…</> : "Disconnect"}</button></>
+              : <><button className="button button-secondary" disabled={gmailBusy || apiState !== "available"} onClick={() => void handleConnectGmail()}>{gmailBusy ? <><LoaderCircle className="spin" size={15} /> Connecting…</> : <><ExternalLink size={15} /> {gmailStatus === "disconnected" ? "Connect Gmail" : "Reconnect Gmail"}</>}</button>{gmailStatus === "unavailable" && <button className="button button-secondary" disabled={gmailBusy} onClick={() => void refreshGmail()}><RefreshCw size={15} /> Retry status</button>}</>}
           </div>
           {gmailError && <div className="inline-error calendar-message"><AlertCircle size={15} />{gmailError}</div>}
-          <div className="calendar-activity-heading"><strong>Recent email activity</strong>{gmailStatus === "connected" && <button className="icon-button" aria-label="Refresh email activity" onClick={() => void refreshGmail()}><RefreshCw size={15} /></button>}</div>
-          {gmailStatus === "unavailable" || gmailError ? <EmptyNotice title="Email activity unavailable" detail="The connection or message lookup could not be verified. No conclusion is available about matching email history." />
-            : gmailStatus === "disconnected" ? <EmptyNotice title="No Gmail connected" detail="Connect Gmail to inspect messages. No example emails are shown." />
-            : gmailStatus === "reauthorization_required" ? <EmptyNotice title="Gmail needs reconnecting" detail="Email data is unavailable until Google authorization is restored." />
-              : emailActivity.length === 0 ? <EmptyNotice title="No recent email activity" detail="Gmail returned no matching messages for the recent activity search." />
-                : <div className="calendar-event-list">{emailActivity.map((message) => <article className="calendar-event email-event" key={message.id}><span className="event-date"><Mail size={14} />{message.sentAt ? new Date(message.sentAt).toLocaleDateString() : "Date unavailable"}</span><div><strong>{message.subject ?? "Subject unavailable"}</strong><span>{message.direction === "OUTBOUND" ? "Sent" : "Received"}{message.leadEmail ? ` · ${message.leadEmail}` : ""}{message.sentAt ? ` · ${new Date(message.sentAt).toLocaleString()}` : ""}</span><StatusPill status={message.responseStatus} /></div></article>)}</div>}
-          <p className="crm-upload-hint">Email drafts and sends are shown for approval before execution. Message history reads use metadata.</p>
         </section>
 
         <section className="panel calendar-panel">
           <div className="panel-title-row">
-            <div><p className="eyebrow">READS · APPROVAL-GATED WRITES</p><h3>Google Calendar</h3></div>
+            <div><p className="eyebrow">AI CONTEXT</p><h3>Google Calendar</h3></div>
             <StatusPill status={calendarStatus} />
           </div>
           <div className="calendar-connection-row">
             <span className="calendar-icon"><CalendarDays size={18} /></span>
             <div className="calendar-copy">
-              <strong>{calendarStatus === "connected" ? "Calendar connected" : calendarStatus === "reauthorization_required" ? "Reconnect required" : "Calendar not connected"}</strong>
-              <span>{calendarStatus === "connected" ? "ManageBizz can inspect events and propose new events. Calendar changes require your approval." : calendarStatus === "reauthorization_required" ? "Google authorization expired. Reconnect to restore calendar access." : "Connect Google Calendar to inspect activity and enable approved event creation."}</span>
+              <strong>{calendarStatus === "connected" ? "Connected" : calendarStatus === "reauthorization_required" ? "Reconnect required" : calendarStatus === "access_denied" ? "Access denied" : calendarStatus === "unavailable" ? "Status unavailable" : "Disconnected"}</strong>
+              <span>{calendarStatus === "connected" ? "Calendar is connected. Your AI agent can use your calendar context when needed." : calendarStatus === "reauthorization_required" ? "Calendar needs authorization again. Reconnect and approve the requested access." : calendarStatus === "access_denied" ? "Google denied Calendar access. Reconnect or review your Google account permissions." : calendarStatus === "unavailable" ? "Calendar access could not be verified. Retry or reconnect to check access." : "Connect Google Calendar to let your AI agent use your calendar context when needed."}</span>
             </div>
-            {calendarStatus === "disconnected" || calendarStatus === "reauthorization_required"
-              ? <button className="button button-secondary" disabled={calendarBusy || apiState !== "available"} onClick={() => void handleConnectCalendar()}>{calendarBusy ? <><LoaderCircle className="spin" size={15} /> Connecting…</> : <><ExternalLink size={15} /> Connect Google Calendar</>}</button>
-              : <><button className="button button-secondary" disabled={calendarBusy || apiState !== "available"} onClick={() => void handleConnectCalendar()}>{calendarBusy ? <><LoaderCircle className="spin" size={15} /> Reconnecting…</> : "Update Calendar access"}</button><button className="button button-secondary" disabled={calendarBusy} onClick={() => void handleDisconnectCalendar()}>{calendarBusy ? <><LoaderCircle className="spin" size={15} /> Disconnecting…</> : "Disconnect"}</button></>}
+            {calendarStatus === "connected"
+              ? <><button className="button button-secondary" disabled={calendarBusy || apiState !== "available"} onClick={() => void handleConnectCalendar()}>{calendarBusy ? <><LoaderCircle className="spin" size={15} /> Reconnecting…</> : "Update Calendar access"}</button><button className="button button-secondary" disabled={calendarBusy} onClick={() => void handleDisconnectCalendar()}>{calendarBusy ? <><LoaderCircle className="spin" size={15} /> Disconnecting…</> : "Disconnect"}</button></>
+              : <><button className="button button-secondary" disabled={calendarBusy || apiState !== "available"} onClick={() => void handleConnectCalendar()}>{calendarBusy ? <><LoaderCircle className="spin" size={15} /> Connecting…</> : <><ExternalLink size={15} /> {calendarStatus === "disconnected" ? "Connect Google Calendar" : "Reconnect Google Calendar"}</>}</button>{calendarStatus === "unavailable" && <button className="button button-secondary" disabled={calendarBusy} onClick={() => void refreshCalendar()}><RefreshCw size={15} /> Retry status</button>}</>}
           </div>
           {calendarError && <div className="inline-error calendar-message"><AlertCircle size={15} />{calendarError}</div>}
-          <div className="calendar-activity-heading"><strong>Upcoming calendar activity</strong>{calendarStatus === "connected" && <button className="icon-button" aria-label="Refresh calendar activity" onClick={() => void refreshCalendar()}><RefreshCw size={15} /></button>}</div>
-          {calendarStatus === "disconnected" ? <EmptyNotice title="No calendar connected" detail="Connect Google Calendar to view events. No example events are shown." />
-            : calendarStatus === "reauthorization_required" ? <EmptyNotice title="Calendar needs reconnecting" detail="Event data is unavailable until Google authorization is restored." />
-              : calendarEvents.length === 0 ? <EmptyNotice title="No upcoming events" detail="Google Calendar returned no upcoming events." />
-                : <div className="calendar-event-list">{calendarEvents.map((event) => <article className="calendar-event" key={event.id}><span className="event-date"><CalendarDays size={14} />{new Date(event.startTime).toLocaleDateString()}</span><div><strong>{event.title || "No title provided"}</strong><span>{new Date(event.startTime).toLocaleString()} – {new Date(event.endTime).toLocaleTimeString()}</span>{event.location && <span>{event.location}</span>}</div></article>)}</div>}
-          <p className="crm-upload-hint">Read-only access. ManageBizz cannot create, update, or cancel calendar events.</p>
         </section>
 
         <section className="overview-grid" aria-label="Workspace overview">
@@ -523,7 +492,12 @@ export default function App() {
               <section className="panel result-panel">
                 <div className="section-heading compact"><div><p className="eyebrow">USER GOAL</p><h3>{goal}</h3></div><StatusPill status={run.status} /></div>
                 {run.status === "failed" && <div className="banner banner-error"><AlertCircle size={17} /><div><strong>Agent run failed</strong><span>{run.error?.message ?? "The agent could not complete this run."}</span></div></div>}
-                <div className="answer-box"><span className="answer-label"><Sparkles size={15} /> AGENT RESPONSE</span><p>{run.answer || "No response was returned by the agent."}</p></div>
+                <div className="answer-box"><span className="answer-label"><Sparkles size={15} /> SUMMARY</span><p>{run.response?.summary || run.answer || "No response was returned by the agent."}</p>{run.response?.evidenceInsufficient && <small className="insufficient-note">Insufficient evidence to determine the requested result.</small>}</div>
+              </section>
+
+              <section className="panel">
+                <div className="panel-title-row"><div><p className="eyebrow">GOAL-DRIVEN EXECUTION</p><h3>Investigation plan</h3></div><span className="count-label">{run.plan?.steps.length ?? 0} {run.plan?.steps.length === 1 ? "step" : "steps"}</span></div>
+                {!run.plan?.steps.length ? <EmptyNotice title="No tool steps selected" detail="The goal did not map to a configured business tool." /> : <ol className="agent-plan-list">{run.plan.steps.map((step, index) => <li className="agent-plan-step" key={`${step.tool}.${step.action}.${index}`}><span className="plan-sequence">{index + 1}</span><div><div className="plan-title"><strong>{step.tool} · {step.action}</strong>{step.dependsOnCRMResults && <span className="dependency-tag">After CRM matches</span>}</div><p>{step.purpose}</p></div></li>)}</ol>}
               </section>
 
               <section className="panel">

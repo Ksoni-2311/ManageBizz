@@ -31,12 +31,10 @@ router.get("/integrations/google-calendar/connect", authenticateToken, googleCal
 router.get("/integrations/google-calendar/callback", googleCalendarCtrl.googleCalendarCallback);
 router.get("/integrations/google-calendar/status", authenticateToken, googleCalendarCtrl.googleCalendarStatus);
 router.delete("/integrations/google-calendar", authenticateToken, googleCalendarCtrl.disconnectGoogleCalendar);
-router.get("/calendar/events/upcoming", authenticateToken, googleCalendarCtrl.upcomingCalendarEvents);
 router.get("/integrations/gmail/connect", authenticateToken, gmailCtrl.connectGmail);
 router.get("/integrations/gmail/callback", gmailCtrl.gmailCallback);
 router.get("/integrations/gmail/status", authenticateToken, gmailCtrl.gmailStatus);
 router.delete("/integrations/gmail", authenticateToken, gmailCtrl.disconnectGmail);
-router.get("/email/activity", authenticateToken, gmailCtrl.emailActivity);
 router.post("/agent/runs", authenticateToken, agentApplicationCtrl.runAgent);
 router.get("/agent/runs/:runId", authenticateToken, agentApplicationCtrl.getAgentRun);
 router.post("/agent/runs/:runId/approvals/:proposalId", authenticateToken, agentApplicationCtrl.decideAgentAction);

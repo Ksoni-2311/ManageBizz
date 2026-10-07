@@ -2,11 +2,14 @@ import { createHash, randomUUID } from "node:crypto";
 import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 
+export type CalendarConnectionHealth = "verified" | "reauthorization_required" | "access_denied" | "unavailable";
 export type CalendarConnection = {
   workspaceId: string;
   userId: string;
   encryptedRefreshToken: string;
   connectedAt: string;
+  tokenVersion?: string;
+  health?: CalendarConnectionHealth;
 };
 
 export interface CalendarConnectionRepository {

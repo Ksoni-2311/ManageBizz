@@ -1,13 +1,14 @@
 import { ToolExecutionContext, ToolResponse } from "@nexusops/shared-types";
 import { z } from "zod";
 import { emailAddress, nonEmpty, requireApprovedAction, runValidated, ToolDomainError } from "./contract.js";
-import { EmailDraftInput, EmailIdentity, EmailProvider, EmailSearch, GmailProvider, MockEmailProvider, ProviderEmail, ProviderEmailDraft, ProviderSentEmail } from "../integrations/gmail/emailProvider.js";
+import { EmailContent, EmailDraftInput, EmailIdentity, EmailProvider, EmailSearch, GmailProvider, MockEmailProvider, ProviderEmail, ProviderEmailDraft, ProviderSentEmail } from "../integrations/gmail/emailProvider.js";
 import { GoogleProviderError } from "../integrations/googleOAuth/googleProviderError.js";
 
 const historySchema = z.object({ leadEmail: emailAddress.optional(), leadEmails: z.array(emailAddress).max(500).optional(), query: z.string().trim().min(1).max(500).optional() }).strict()
   .refine(({ leadEmail, leadEmails }) => !(leadEmail && leadEmails), "Use leadEmail or leadEmails, not both")
   .refine(({ leadEmails }) => !leadEmails || new Set(leadEmails.map((email) => email.toLowerCase())).size === leadEmails.length, "leadEmails must be unique")
 const metadataSchema = z.object({ messageId: nonEmpty.max(500) }).strict();
+const contentSearchSchema = z.object({ leadEmail: emailAddress.optional(), query: z.string().trim().min(1).max(500), limit: z.number().int().min(1).max(5).default(5) }).strict();
 const emailSchema = z.object({ to: emailAddress, subject: nonEmpty.max(998).refine((value) => !/[\r\n]/.test(value), "Subject cannot contain line breaks."), body: nonEmpty.max(100_000) }).strict();
 const sendSchema = z.object({ draftId: nonEmpty.max(500) }).strict();
 const messageSchema = z.object({ id: nonEmpty, threadId: nonEmpty.optional(), leadEmail: emailAddress.optional(), direction: z.enum(["OUTBOUND", "INBOUND"]), subject: nonEmpty.optional(), sentAt: z.string().datetime().optional(), inReplyToMessageId: nonEmpty.optional(), messageId: nonEmpty.optional() }).strict();
@@ -55,6 +56,10 @@ export class EmailToolService {
   }
   getEmailMetadata(params: unknown, context: ToolExecutionContext): Promise<ToolResponse<ProviderEmail | null>> {
     return runValidated(metadataSchema, params, context, async ({ messageId }) => (await this.translate(() => this.service.metadata(identity(context), messageId))) ?? null);
+  }
+  getEmailContent(params: unknown, context: ToolExecutionContext): Promise<ToolResponse<EmailContent[]>> {
+    return runValidated(contentSearchSchema, params, context, ({ leadEmail, query, limit }) =>
+      this.translate(() => this.provider.searchContent(identity(context), { ...(leadEmail ? { leadEmail } : {}), query }, limit ?? 5)));
   }
   connectionStatus(context: ToolExecutionContext) { return this.service.status(identity(context)); }
   private async translate<T>(run: () => Promise<T>): Promise<T> {
