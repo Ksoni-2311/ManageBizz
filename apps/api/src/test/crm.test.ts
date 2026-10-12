@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { ACTIVE_PIPELINE_STATUSES, getActiveHighValueLeads, getInactiveHighValueLeads, normalizeCRMDate, validateCRMLeads } from "../tools/crmDomain.js";
+import { ACTIVE_PIPELINE_STATUSES, getActiveHighValueLeads, getInactiveHighValueLeads, normalizeCRMDate, resolveCRMContact, validateCRMLeads } from "../tools/crmDomain.js";
 import { CRMToolService } from "../tools/crmTool.js";
 
 const records: Record<string, unknown>[] = [
@@ -13,9 +13,32 @@ const leads = validateCRMLeads(records);
 const fixedNow = new Date("2026-09-01T00:00:00Z");
 
 describe("CRM domain", () => {
+  it("resolves exact and normalized identities, exact company pairs, and reports ambiguous candidates", () => {
+    const contacts = validateCRMLeads([
+      { ...records[0], id: "rahul-a", name: "Rahul Sharma", email: "Rahul@Acme.test", company: "Acme Technologies Ltd" },
+      { ...records[1], id: "rahul-b", name: "Rahul Verma", email: "rahul@other.test", company: "Other Inc" },
+      { ...records[2], id: "maya", name: "Maya Shah", email: "maya@acme.test", company: "Acme Technologies Limited", phone: "+1 (555) 321-9876" }
+    ]);
+    assert.equal(resolveCRMContact(contacts, { query: " rahul@ACME.TEST " }).status, "RESOLVED");
+    assert.equal(resolveCRMContact(contacts, { query: "Rahul Sharma", company: "Acme Technologies" }).status, "RESOLVED");
+    const firstName = resolveCRMContact(contacts, { query: "Rahul" });
+    assert.equal(firstName.status, "AMBIGUOUS");
+    if (firstName.status === "AMBIGUOUS") assert.deepEqual(firstName.candidates.map(({ canonicalName }) => canonicalName), ["Rahul Sharma", "Rahul Verma"]);
+    const company = resolveCRMContact(contacts, { query: "Acme Technologies" });
+    assert.equal(company.status, "AMBIGUOUS", "a company with multiple CRM contacts requires clarification");
+    const domain = resolveCRMContact(contacts, { query: "new@acme.test" });
+    assert.equal(domain.status, "AMBIGUOUS", "domain similarity must never choose a different person's email");
+    const fuzzy = resolveCRMContact(contacts, { query: "Rahul Sharm" });
+    assert.equal(fuzzy.status, "AMBIGUOUS", "fuzzy candidates require clarification");
+    const phone = resolveCRMContact(contacts, { query: "1-555-321-9876" });
+    assert.equal(phone.status, "RESOLVED");
+    if (phone.status === "RESOLVED") assert.equal(phone.entity.matchedBy, "exact_phone");
+    assert.deepEqual(resolveCRMContact(contacts, { query: "Missing Person" }), { status: "NOT_FOUND", query: "Missing Person" });
+  });
+
   it("loads validated CRM rows into the service without altering record identity", async () => {
     const service = new CRMToolService({ clock: () => fixedNow });
-    service.setLeads(records, "o");
+    service.setLeads(records, "o", "u");
     const context = { goalId: "g", runId: "r", actionId: "load", userId: "u", orgId: "o" };
     const loaded = await service.searchLeads({}, context);
     assert.equal(loaded.success, true);
@@ -25,7 +48,7 @@ describe("CRM domain", () => {
     }
     const invalid = records.map((record) => ({ ...record }));
     invalid.push({ ...records[0]!, id: "duplicate-row" });
-    assert.throws(() => service.setLeads(invalid, "o"), /Duplicate CRM lead identity/);
+    assert.throws(() => service.setLeads(invalid, "o", "u"), /Duplicate CRM lead identity/);
     const afterInvalidLoad = await service.searchLeads({}, context);
     if (afterInvalidLoad.success) assert.equal(afterInvalidLoad.data.length, records.length);
   });
@@ -67,7 +90,7 @@ describe("CRM domain", () => {
 
   it("applies a requested minimum deal value through the CRM search service", async () => {
     const service = new CRMToolService({ clock: () => fixedNow });
-    service.setLeads(records, "o");
+    service.setLeads(records, "o", "u");
     const context = { goalId: "g", runId: "r", actionId: "search", userId: "u", orgId: "o" };
     const response = await service.searchLeads({ minDealValue: 100_000 }, context);
     assert.equal(response.success, true);
@@ -75,5 +98,14 @@ describe("CRM domain", () => {
       assert.ok(response.data.every((lead) => lead.dealValue >= 100_000));
       assert.ok(response.data.every((lead) => leads.some((source) => source.id === lead.id)));
     }
+  });
+
+  it("scopes development fallback CRM records by both workspace and user", async () => {
+    const service = new CRMToolService();
+    service.setLeads(records, "workspace", "owner");
+    const owner = await service.searchLeads({}, { goalId: "g", runId: "r", actionId: "a", userId: "owner", orgId: "workspace" });
+    const anotherUser = await service.searchLeads({}, { goalId: "g", runId: "r", actionId: "b", userId: "other", orgId: "workspace" });
+    assert.equal(owner.success && owner.data.length, records.length);
+    assert.deepEqual(anotherUser.success && anotherUser.data, []);
   });
 });

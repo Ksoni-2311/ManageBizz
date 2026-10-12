@@ -1,3 +1,5 @@
+import type { AgentPlan, AgentStructuredResult, EvidenceBundle, GroundedAnswer } from "@nexusops/shared-types";
+
 export type RunStatus = "running" | "awaiting_approval" | "completed" | "failed";
 const SESSION_TOKEN_KEY = "managebizz.session.token";
 export type AuthenticatedUser = { id: string; name: string; email: string; role: string; workspaceId: string };
@@ -84,6 +86,8 @@ export type EvidenceFact = {
   action: string;
   statement: string;
   outcome: "EMPTY_RESULT" | "RESULT_RETURNED" | "SUCCESS_NOT_CONFIRMED";
+  recordRefs?: string[];
+  matchingCriteria?: string[];
   error?: { code: string; message: string };
 };
 
@@ -108,15 +112,27 @@ export type AgentRun = {
     summary: string;
     facts: EvidenceFact[];
     inferences: string[];
-    recommendations: Array<{ statement: string; evidenceRefs: string[] }>;
+    recommendations: AgentRecommendation[];
     evidenceInsufficient: boolean;
+    groundedAnswer?: GroundedAnswer;
+    limitations: string[];
   };
+  structuredResult?: AgentStructuredResult;
+  groundedAnswer?: GroundedAnswer;
   plan?: { objective: string; factsRequired: string[]; steps: Array<{ tool: string; action: string; purpose: string; dependsOnCRMResults: boolean }> };
-  evidence: { facts: EvidenceFact[]; inferences: string[]; evidenceInsufficient: boolean };
-  recommendations: Array<{ statement: string; evidenceRefs: string[] }>;
+  queryPlan?: AgentPlan;
+  evidence: { facts: EvidenceFact[]; inferences: string[]; evidenceInsufficient: boolean; bundle: EvidenceBundle };
+  recommendations: AgentRecommendation[];
   actions: ActionProposal[];
   trace: Trace;
   error?: { code: string; message: string };
+};
+
+export type AgentRecommendation = {
+  statement: string;
+  reason: string;
+  evidenceRefs: string[];
+  expectedOutcome: string;
 };
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
@@ -222,10 +238,10 @@ export async function checkApi(): Promise<void> {
   await request<{ status: string }>("/health");
 }
 
-export function submitGoal(goal: string): Promise<AgentRun> {
+export function submitGoal(goal: string, timezone?: string): Promise<AgentRun> {
   return request<AgentRun>("/api/agent/runs", {
     method: "POST",
-    body: JSON.stringify({ goal })
+    body: JSON.stringify({ goal, ...(timezone ? { timezone } : {}) })
   });
 }
 

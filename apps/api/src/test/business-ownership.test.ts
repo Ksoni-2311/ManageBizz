@@ -57,11 +57,11 @@ describe("business data ownership", () => {
     assert.deepEqual(wrongOwner.success && wrongOwner.data, []);
   });
 
-  it("keeps development fallback CRM data scoped to the explicitly seeded workspace", async () => {
+  it("keeps development fallback CRM data scoped to the explicitly seeded workspace and owner", async () => {
     const crm = new CRMToolService({ repository: new InMemoryCRMRepository() });
     const workspaceA = workspaceIdFor("org", "user-a");
     const workspaceB = workspaceIdFor("org", "user-b");
-    crm.setLeads([lead], workspaceA);
+    crm.setLeads([lead], workspaceA, "user-a");
     const own = await crm.searchLeads({}, toolContext(workspaceA, "user-a"));
     const other = await crm.searchLeads({}, toolContext(workspaceB, "user-b"));
     assert.equal(own.success && own.data.length, 1);

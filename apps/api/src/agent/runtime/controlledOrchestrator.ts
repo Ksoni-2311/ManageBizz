@@ -1,4 +1,4 @@
-import { ParsedGoal, ToolExecutionContext, ToolResponse } from "@nexusops/shared-types";
+import { AgentPlan, ParsedGoal, ToolExecutionContext, ToolResponse } from "@nexusops/shared-types";
 import { emptyToolCallKey, ToolObservation, verifiedActionStatement } from "../policies/dataIntegrity.js";
 import { DEFAULT_MIN_DEAL_VALUE } from "../../tools/crmDomain.js";
 
@@ -31,6 +31,10 @@ export type ControlledRunResult = {
   error?: string;
 };
 
+export class PlanningError extends Error {
+  constructor(message: string, readonly code = "PLANNING_FAILED") { super(message); this.name = "PlanningError"; }
+}
+
 function matches(text: string, expression: RegExp): boolean {
   return expression.test(text);
 }
@@ -48,38 +52,105 @@ export function parseRequestedMinimumDealValue(objective: string): number | unde
   return Number.isFinite(result) && result >= 0 ? result : undefined;
 }
 
-function calendarParams(objective: string, now = new Date()): Record<string, unknown> {
-  const day = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
+function calendarParams(
+  objective: string,
+  now = new Date(),
+  timezone?: string,
+  dateRange?: AgentPlan["dateRange"]
+): Record<string, unknown> {
+  const currentDay = dateInTimezone(now, timezone);
+  if (dateRange?.type === "absolute" && dateRange.start) {
+    const start = dateRange.start;
+    const end = dateRange.end;
+    if (start.includes("T") && end?.includes("T")) {
+      return { from: new Date(start).toISOString(), until: new Date(end).toISOString() };
+    }
+    const firstDay = start.slice(0, 10);
+    const endDay = end?.slice(0, 10) ?? addCalendarDays(firstDay, 1);
+    return { from: localMidnight(firstDay, timezone).toISOString(), until: localMidnight(endDay, timezone).toISOString() };
+  }
   const explicitDate = objective.match(/\b(\d{4}-\d{2}-\d{2})(?:T\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})?)?\b/)?.[1];
-  let start: Date | undefined;
-  let days = 1;
-  if (explicitDate) start = new Date(`${explicitDate}T00:00:00.000Z`);
-  else if (/\btomorrow\b/i.test(objective)) {
-    start = new Date(day); start.setUTCDate(start.getUTCDate() + 1);
-  } else if (/\btoday\b/i.test(objective)) start = day;
-  else if (/\bthis week\b/i.test(objective)) {
-    start = day;
-    days = 7;
+  let firstDay: string | undefined;
+  let endDay: string | undefined;
+  if (explicitDate) {
+    firstDay = explicitDate;
+    endDay = addCalendarDays(explicitDate, 1);
+  } else if (/\btomorrow\b/i.test(objective)) {
+    firstDay = addCalendarDays(currentDay, 1);
+    endDay = addCalendarDays(firstDay, 1);
+  } else if (/\byesterday\b/i.test(objective)) {
+    firstDay = addCalendarDays(currentDay, -1);
+    endDay = currentDay;
+  } else if (/\btoday\b/i.test(objective)) {
+    firstDay = currentDay;
+    endDay = addCalendarDays(currentDay, 1);
+  } else if (/\bthis week\b/i.test(objective)) {
+    firstDay = startOfWeek(currentDay);
+    endDay = addCalendarDays(firstDay, 7);
+  } else if (/\bnext week\b/i.test(objective)) {
+    firstDay = addCalendarDays(startOfWeek(currentDay), 7);
+    endDay = addCalendarDays(firstDay, 7);
   }
-  const weekday = objective.match(/\b(?:before|by|on)\s+(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b/i)?.[1]?.toLocaleLowerCase("en-US");
-  if (!start && weekday) {
-    const weekdayIndex = ["sunday", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday"].indexOf(weekday);
-    const offset = (weekdayIndex - day.getUTCDay() + 7) % 7 || 7;
-    start = day;
-    days = offset + (/\b(before|by)\b/i.test(objective) ? 0 : 1);
+  const weekday = objective.match(/\b(?:before|by|after|on)\s+(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b/i)?.[1]?.toLocaleLowerCase("en-US");
+  if (!firstDay && weekday) {
+    const today = new Date(`${currentDay}T00:00:00.000Z`).getUTCDay();
+    const target = ["sunday", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday"].indexOf(weekday);
+    const offset = (target - today + 7) % 7;
+    if (/\bafter\b/i.test(objective)) {
+      firstDay = addCalendarDays(currentDay, offset + 1);
+      endDay = addCalendarDays(firstDay, 7);
+    } else {
+      firstDay = currentDay;
+      endDay = addCalendarDays(currentDay, Math.max(1, offset));
+    }
   }
-  if (!start) {
-    start = now;
-    days = 7;
+  const lastDays = objective.match(/\b(?:last|past)\s+(\d+)\s+days?\b/i)?.[1];
+  if (!firstDay && lastDays) {
+    firstDay = addCalendarDays(currentDay, -Number(lastDays) + 1);
+    endDay = addCalendarDays(currentDay, 1);
   }
-  const end = new Date(start);
-  end.setUTCDate(end.getUTCDate() + days);
-  const params: Record<string, unknown> = { from: start.toISOString(), until: end.toISOString() };
+  const params: Record<string, unknown> = firstDay
+    ? { from: localMidnight(firstDay, timezone).toISOString(), until: localMidnight(endDay!, timezone).toISOString() }
+    : { from: now.toISOString() };
   const duration = objective.match(/\b(\d+)\s*(?:minutes?|mins?)\b/i)?.[1];
   if (duration) params.durationMinutes = Number(duration);
   const searchTerm = objective.match(/\b(?:with|about|titled)\s+([a-z0-9][a-z0-9 .'-]{1,60})/i)?.[1]?.trim().split(/\s+(?:before|after|tomorrow|today|this|next|on|for)\b/i)[0]?.trim();
   if (searchTerm && !/^(my|the|a|an|calendar)$/i.test(searchTerm)) params.queryTerm = searchTerm;
   return params;
+}
+
+function dateInTimezone(now: Date, timezone?: string): string {
+  const parts = new Intl.DateTimeFormat("en-CA", { timeZone: timezone || "UTC", year: "numeric", month: "2-digit", day: "2-digit" }).formatToParts(now);
+  const values = Object.fromEntries(parts.map(({ type, value }) => [type, value]));
+  return `${values.year}-${values.month}-${values.day}`;
+}
+
+function localMidnight(day: string, timezone?: string): Date {
+  const [year, month, date] = day.split("-").map(Number);
+  const target = Date.UTC(year!, month! - 1, date!);
+  if (!timezone) return new Date(target);
+  let candidate = target;
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const parts = new Intl.DateTimeFormat("en-CA", {
+      timeZone: timezone, year: "numeric", month: "2-digit", day: "2-digit",
+      hour: "2-digit", minute: "2-digit", second: "2-digit", hourCycle: "h23"
+    }).formatToParts(new Date(candidate));
+    const values = Object.fromEntries(parts.map(({ type, value }) => [type, Number(value)]));
+    const localAsUtc = Date.UTC(values.year!, values.month! - 1, values.day!, values.hour!, values.minute!, values.second!);
+    candidate += target - localAsUtc;
+  }
+  return new Date(candidate);
+}
+
+function addCalendarDays(day: string, amount: number): string {
+  const date = new Date(`${day}T00:00:00.000Z`);
+  date.setUTCDate(date.getUTCDate() + amount);
+  return date.toISOString().slice(0, 10);
+}
+
+function startOfWeek(day: string): string {
+  const weekday = new Date(`${day}T00:00:00.000Z`).getUTCDay();
+  return addCalendarDays(day, -((weekday + 6) % 7));
 }
 
 function gmailQuery(objective: string): string {
@@ -94,12 +165,21 @@ function gmailQuery(objective: string): string {
   return [rangeQuery, ...keywords.slice(0, 5)].filter(Boolean).join(" ");
 }
 
-function metricCall(goal: string, days: number): PlannedToolCall | undefined {
-  if (matches(goal, /\b(conversion|win rate)\b/i)) return { tool: "analytics", action: "getConversionMetrics", params: { timeWindowDays: days }, purpose: "Retrieve the requested conversion metrics." };
-  if (matches(goal, /\b(sales|revenue|mrr|arr)\b/i)) return { tool: "analytics", action: "getSalesMetrics", params: { timeWindowDays: days }, purpose: "Retrieve the requested sales metrics." };
-  if (matches(goal, /\b(activity|emails sent|meetings held|tasks completed)\b/i)) return { tool: "analytics", action: "getActivityMetrics", params: { timeWindowDays: days }, purpose: "Retrieve the requested activity metrics." };
-  if (matches(goal, /\b(analytics|metrics|performance)\b/i)) return { tool: "analytics", action: "getLeadMetrics", params: { timeWindowDays: days }, purpose: "Retrieve the requested lead metrics." };
+function metricCall(goal: string, days?: number): PlannedToolCall | undefined {
+  const params = days === undefined ? {} : { timeWindowDays: days };
+  if (matches(goal, /\b(conversion|win rate)\b/i)) return { tool: "analytics", action: "getConversionMetrics", params, purpose: "Retrieve the requested conversion metrics." };
+  if (matches(goal, /\b(sales|revenue|mrr|arr)\b/i)) return { tool: "analytics", action: "getSalesMetrics", params, purpose: "Retrieve the requested sales metrics." };
+  if (matches(goal, /\b(activity|emails sent|meetings held|tasks completed)\b/i)) return { tool: "analytics", action: "getActivityMetrics", params, purpose: "Retrieve the requested activity metrics." };
+  if (matches(goal, /\b(analytics|metrics|performance)\b/i)) return { tool: "analytics", action: "getLeadMetrics", params, purpose: "Retrieve the requested lead metrics." };
   return undefined;
+}
+
+function explicitRangeDays(expression?: string): number | undefined {
+  const match = expression?.match(/\b(?:last|past)\s+(\d+)\s+(day|days|week|weeks|month|months)\b/i);
+  if (!match) return undefined;
+  const value = Number(match[1]);
+  const unit = match[2]!.toLocaleLowerCase("en-US");
+  return value * (unit.startsWith("week") ? 7 : unit.startsWith("month") ? 30 : 1);
 }
 
 function requestedTaskAction(objective: string): PlannedToolCall | undefined {
@@ -135,8 +215,233 @@ function requestedDirectAction(objective: string): PlannedToolCall | undefined {
   return undefined;
 }
 
-/** A small deterministic planner: one root query, then only evidence-gated follow-up queries. */
-export function planBusinessGoal(parsed: ParsedGoal): InvestigationPlan {
+/** Builds a tool plan from validated query analysis; legacy callers retain the deterministic planner below. */
+export function planBusinessGoal(parsed: ParsedGoal, queryPlan?: AgentPlan, timezone?: string): InvestigationPlan {
+  if (queryPlan) {
+    const explicitFollowUpAction = /\b(?:create|add)\b[\s\S]{0,50}\b(?:tasks?)\b/i.test(parsed.objective) &&
+      /\b(follow[- ]?up|these leads|those leads|them)\b/i.test(parsed.objective) ||
+      /^\s*(?:please\s+)?(?:follow[- ]?up with|send follow[- ]?up(?: emails?)?|email all)\b/i.test(parsed.objective);
+    const hasExplicitFollowUpCriteria = /\bhigh[- ]?value\b/i.test(parsed.objective) &&
+      /\b(?:last|past)\s+\d+\s+(?:days?|weeks?|months?)\b/i.test(parsed.objective);
+    if (explicitFollowUpAction && hasExplicitFollowUpCriteria) return planLegacyBusinessGoal(parsed);
+    return planStructuredQuery(parsed, queryPlan, timezone);
+  }
+  return planLegacyBusinessGoal(parsed);
+}
+
+function planStructuredQuery(parsed: ParsedGoal, analysis: AgentPlan, timezone?: string): InvestigationPlan {
+  if (analysis.intent === "unknown" || analysis.sources.length === 0) {
+    throw new PlanningError("The request could not be classified safely, so no business tools were called.");
+  }
+  if (analysis.ambiguity.type !== "none" && analysis.ambiguity.type !== "entity_resolution_required") {
+    throw new PlanningError(analysis.ambiguity.details || "The request needs clarification before a safe lookup can be made.");
+  }
+
+  const objective = parsed.objective.trim();
+  const entity = analysis.entities[0];
+  const address = analysis.entities.find(({ type }) => type === "email")?.value;
+  const personOrCompanyEntity = analysis.entities.find(({ type }) => type === "person")
+    ?? analysis.entities.find(({ type }) => type === "company")
+    ?? analysis.entities.find(({ type }) => type === "phone");
+  const personOrCompany = personOrCompanyEntity?.value;
+  const resolveCRMFirst = analysis.sources.includes("crm") && Boolean(personOrCompany || address) &&
+    (analysis.intent === "email_reply_check" || analysis.intent === "cross_source_contact_status" ||
+      ((analysis.intent === "email_search" || analysis.intent === "email_content_question") && analysis.sources.includes("gmail")) ||
+      (analysis.intent === "calendar_event_search" && analysis.sources.includes("calendar")));
+  const initialCalls: PlannedToolCall[] = [];
+  const dependentCalls: PlannedToolCall[] = [];
+  const factsRequired = [...new Set([
+    ...analysis.requestedFacts,
+    ...analysis.analyticalRequirements,
+    ...analysis.outputRequirements
+  ])];
+  const toolMappings: InvestigationPlan["toolMappings"] = [];
+  const addCall = (call: PlannedToolCall, dependent = false) => {
+    (dependent ? dependentCalls : initialCalls).push(call);
+    toolMappings.push({ fact: call.purpose, tool: call.tool, action: call.action });
+  };
+
+  if (analysis.intent === "task_action") {
+    const action = requestedTaskAction(objective) ?? requestedDirectAction(objective);
+    if (!action) throw new PlanningError("The request does not contain a complete supported action, so no action was proposed.");
+    addCall(action);
+    return {
+      objective,
+      factsRequired,
+      toolMappings,
+      initialCalls,
+      downstream: {
+        emailHistoryForCandidates: false,
+        emailAction: "getEmailHistory",
+        calendarAvailabilityForCandidates: false,
+        calendarParams: {},
+        sendFollowUpForCandidates: false,
+        createFollowUpTasksForCandidates: false
+      },
+      finalEvidence: factsRequired
+    };
+  }
+
+  if (analysis.sort) throw new PlanningError("The current business tools cannot apply the explicitly requested sort order.");
+  if (analysis.limit && analysis.intent !== "email_content_question") {
+    throw new PlanningError("The current business tools cannot apply the explicitly requested result limit.");
+  }
+
+  if (analysis.sources.includes("crm")) {
+    if (resolveCRMFirst) {
+      const company = analysis.entities.find(({ type }) => type === "company")?.value;
+      addCall({
+        tool: "crm", action: "resolveContact",
+        params: { query: address ?? personOrCompany!, ...(company ? { company } : {}) },
+        purpose: "Resolve the named person or company against authenticated CRM records before querying connected sources."
+      });
+    } else if (analysis.intent === "crm_deal_value") {
+      if (!entity) throw new PlanningError("A person, company, or email address is required to look up a CRM deal value.");
+      addCall({
+        tool: "crm", action: "searchLeads", params: { query: entity.value },
+        purpose: "Find CRM records matching the entity explicitly named by the user."
+      });
+    } else if (analysis.intent === "crm_lead_search" || analysis.intent === "email_reply_check" || analysis.intent === "calendar_event_search") {
+      const highValue = analysis.filters.some(({ field, value }) => field === "highValue" && value === true);
+      const minimumFilter = analysis.filters.find(({ field, operator, value }) =>
+        field === "dealValue" && operator === "greater_than_or_equal" && typeof value === "number");
+      const lastContactFilter = analysis.filters.find(({ field }) => field === "lastContactedAt");
+      const dayCount = explicitRangeDays(analysis.dateRange?.expression);
+      if (lastContactFilter && !highValue) {
+        throw new PlanningError("The current CRM tools cannot safely filter by last-contact date without also applying a high-value filter; no CRM lookup was run.");
+      }
+      if (lastContactFilter && !dayCount) {
+        throw new PlanningError("The current CRM tools require a numeric relative inactivity window for this query; no CRM lookup was run.");
+      }
+      if (/\b(inactive|stale|dormant|not contacted)\b/i.test(objective) && !lastContactFilter) {
+        throw new PlanningError("The query implies an inactivity window but does not specify one; no date range was invented and no CRM lookup was run.");
+      }
+      if (highValue && lastContactFilter && dayCount) {
+        const explicitMinimum = parseRequestedMinimumDealValue(objective);
+        addCall({
+          tool: "crm", action: "listInactiveLeads",
+          params: { minDaysInactive: dayCount, minDealValue: explicitMinimum ?? DEFAULT_MIN_DEAL_VALUE },
+          purpose: "Find leads meeting the explicitly requested high-value and last-contact criteria."
+        });
+      } else if (highValue || minimumFilter) {
+        const explicitMinimum = parseRequestedMinimumDealValue(objective);
+        addCall({
+          tool: "crm", action: "searchLeads",
+          params: {
+            ...(personOrCompany || address ? { query: personOrCompany ?? address } : {}),
+            minDealValue: explicitMinimum ?? (minimumFilter && typeof minimumFilter.value === "number" ? minimumFilter.value : DEFAULT_MIN_DEAL_VALUE)
+          },
+          purpose: "Find CRM records meeting the explicitly requested deal-value criterion."
+        });
+      } else {
+        addCall({
+          tool: "crm", action: "searchLeads",
+          params: personOrCompany || address ? { query: personOrCompany ?? address } : {},
+          purpose: "Find CRM records matching the requested client or contact criteria."
+        });
+      }
+    } else {
+      throw new PlanningError(`The current CRM tools cannot safely carry out the ${analysis.intent} plan.`);
+    }
+  }
+
+  if (analysis.sources.includes("gmail")) {
+    const query = gmailQuery(objective) || personOrCompany || address;
+    if (!query && !address) throw new PlanningError("The current Gmail tools require a search term or an explicit email address.");
+    if (analysis.sources.includes("crm")) {
+      const action = analysis.intent === "email_content_question" ? "getEmailContent" : "getEmailHistory";
+      dependentCalls.push({
+        tool: "email",
+        action,
+        params: {
+          ...(analysis.intent === "email_reply_check" || analysis.intent === "cross_source_contact_status" ? {} : { query }),
+          ...(action === "getEmailContent" ? { limit: analysis.limit ?? 5 } : {})
+        },
+        purpose: resolveCRMFirst
+          ? "Search Gmail only with the exact email address returned by CRM identity resolution."
+          : "Search Gmail only for the email addresses of contacts returned by the requested CRM criteria."
+      });
+      toolMappings.push({ fact: "Gmail evidence for the CRM-resolved contact", tool: "email", action });
+    } else {
+      const action = analysis.intent === "email_content_question" ? "getEmailContent" : "getEmailHistory";
+      const params = {
+        ...(address ? { leadEmail: address } : {}),
+        query: query!,
+        ...(action === "getEmailContent" ? { limit: analysis.limit ?? 5 } : {})
+      };
+      addCall({
+        tool: "email", action, params,
+        purpose: "Search Gmail using only terms and sender information derived from the user's request."
+      });
+    }
+  }
+
+  if (analysis.sources.includes("calendar")) {
+    if (analysis.dateRange && !(analysis.dateRange.timezone ?? timezone)) {
+      throw new PlanningError("A user timezone is required to convert the requested Calendar date range; no UTC range was assumed.");
+    }
+    const params = calendarParams(objective, new Date(), analysis.dateRange?.timezone ?? timezone, analysis.dateRange);
+    if (resolveCRMFirst) {
+      dependentCalls.push({
+        tool: "calendar", action: "findEventsForLead", params: boundedContactCalendarParams(params),
+        purpose: "Find Calendar events only when the CRM-resolved email is an exact attendee match."
+      });
+      toolMappings.push({ fact: "Calendar events with the CRM-resolved contact", tool: "calendar", action: "findEventsForLead" });
+    } else if (analysis.sources.includes("crm")) {
+      dependentCalls.push({
+        tool: "calendar", action: "findEventsForLead", params: boundedContactCalendarParams(params),
+        purpose: "Find calendar events only for contacts returned by the requested CRM query."
+      });
+      toolMappings.push({ fact: "Calendar events for CRM-matched contacts", tool: "calendar", action: "findEventsForLead" });
+    } else {
+      const availability = analysis.intent === "calendar_availability";
+      addCall({
+        tool: "calendar",
+        action: availability ? "getAvailability" : "listUpcomingEvents",
+        params,
+        purpose: availability
+          ? "Check Calendar busy periods within the date range stated by the user."
+          : "Find Calendar events within the date range stated by the user."
+      });
+    }
+  }
+
+  if (analysis.sources.includes("analytics")) {
+    const metric = metricCall(objective, explicitRangeDays(analysis.dateRange?.expression));
+    if (!metric) throw new PlanningError("The current analytics tools cannot safely map the requested metric.");
+    addCall(metric);
+  }
+
+  if (analysis.sources.includes("tasks")) {
+    const task = requestedTaskAction(objective);
+    if (task) addCall(task);
+    else {
+      addCall({ tool: "tasks", action: "listOpenTasks", params: {}, purpose: "Retrieve open tasks requested by the user." });
+    }
+  }
+
+  if (!initialCalls.length) throw new PlanningError("No current tool can safely execute the validated query plan.");
+  const downstream: InvestigationPlan["downstream"] = {
+    emailHistoryForCandidates: false,
+    emailAction: "getEmailHistory",
+    calendarAvailabilityForCandidates: false,
+    calendarParams: {},
+    sendFollowUpForCandidates: false,
+    createFollowUpTasksForCandidates: false
+  };
+  return {
+    objective,
+    factsRequired,
+    toolMappings,
+    initialCalls,
+    dependentCalls,
+    downstream,
+    finalEvidence: factsRequired.length ? factsRequired : ["Evidence returned by the requested sources"]
+  };
+}
+
+/** Legacy deterministic planner retained for callers that do not yet provide query analysis. */
+function planLegacyBusinessGoal(parsed: ParsedGoal): InvestigationPlan {
   const objective = parsed.objective.trim();
   const lower = objective.toLocaleLowerCase("en-US");
   const directAction = requestedDirectAction(objective);
@@ -147,25 +452,33 @@ export function planBusinessGoal(parsed: ParsedGoal): InvestigationPlan {
     : lower;
   const mentionsLeads = matches(intentLower, /\b(lead|leads|prospect|prospects)\b/) ||
     matches(intentLower, /\b(attention|follow[- ]?up)\b/);
-  const highValueRequested = matches(intentLower, /\bhigh[- ]?value\b/) || parseRequestedMinimumDealValue(objective) !== undefined ||
-    (mentionsLeads && matches(intentLower, /\b(attention|follow[- ]?up|stale|dormant)\b/));
-  // For the MVP, "needs attention" means a high-value lead whose last contact
-  // is older than the requested/default recency window. Pipeline status remains
-  // a separate definition used only by the active query.
-  const wantsInactiveLeads = mentionsLeads && highValueRequested && matches(lower, /\b(inactive|stale|dormant|attention|follow[- ]?up)\b/);
+  const highValueRequested = matches(intentLower, /\bhigh[- ]?value\b/) || parseRequestedMinimumDealValue(objective) !== undefined;
+  const mentionsInactivity = matches(intentLower, /\b(inactive|stale|dormant|not contacted|haven.t been contacted)\b/);
+  const hasExplicitInactivityWindow = matches(intentLower, /\b(?:last|past)\s+\d+\s+(?:days?|weeks?|months?)\b|\b(?:since|after|before)\s+\d{4}-\d{2}-\d{2}\b/);
+  // Inactivity requires an explicit date window; pipeline status is separate.
+  const wantsInactiveLeads = mentionsLeads && highValueRequested && mentionsInactivity && hasExplicitInactivityWindow;
   const wantsActiveLeads = mentionsLeads && highValueRequested && matches(lower, /\bactive\b/);
   const hasUnsupportedUpperBound = highValueRequested && /\b(below|under|less than|at most|maximum)\b|<=|≤/i.test(lower);
   const wantsHighValueLeads = mentionsLeads && highValueRequested;
-  const wantsLeadInvestigation = !hasUnsupportedUpperBound && wantsHighValueLeads;
+  const wantsLeadInvestigation = !hasUnsupportedUpperBound && wantsHighValueLeads && !(mentionsInactivity && !hasExplicitInactivityWindow);
+  if (mentionsInactivity && highValueRequested && !hasExplicitInactivityWindow && !hasUnsupportedUpperBound) {
+    throw new PlanningError("The query implies an inactivity window but does not specify one; no date range was invented and no CRM lookup was run.");
+  }
+  const inactivityDays = explicitRangeDays(objective);
+  if (wantsInactiveLeads && !inactivityDays) {
+    throw new PlanningError("The current CRM tools require a numeric relative inactivity window; no CRM lookup was run.");
+  }
   const createFollowUpTasksForCandidates = wantsLeadInvestigation && !taskAction &&
     matches(objective, /\b(?:create|add)\b[\s\S]{0,50}\b(?:tasks?)\b/i) &&
     matches(objective, /\b(follow[- ]?up|these leads|those leads|them)\b/i);
-  const wantsEmail = !createFollowUpTasksForCandidates && matches(intentLower, /\b(email|emails|gmail|mailbox|communication|repl(?:y|ied|ies)|response|outreach|follow[- ]?up|re-engage|reengage|unanswered messages?|deadline|what did .+ say|mention(?:ed)?)\b/);
+  const wantsEmail = !createFollowUpTasksForCandidates &&
+    (matches(intentLower, /\b(email|emails|gmail|mailbox|communication|repl(?:y|ied|ies)|response|outreach|unanswered messages?|deadline|what did .+ say|mention(?:ed)?)\b/) ||
+      matches(objective, /^\s*(?:please\s+)?(?:follow[- ]?up with|send follow[- ]?up(?: emails?)?|email all)\b/i));
   const sendFollowUpForCandidates = wantsInactiveLeads && matches(objective, /^\s*(?:please\s+)?(?:follow[- ]?up with|send follow[- ]?up(?: emails?)? to|email all)\b/i);
   const emailAction: InvestigationPlan["downstream"]["emailAction"] = matches(intentLower, /\b(unanswered|unreplied)\b|haven.t received a reply|no reply\b/) ? "getUnansweredMessages" : "getEmailHistory";
   const wantsCalendar = matches(intentLower, /\b(calendar|availability|schedule|scheduling|meeting|meetings|event|events|time slots?|tomorrow|today)\b/);
   const wantsTasks = matches(intentLower, /\b(open tasks?|list tasks?|show tasks?)\b/);
-  const metric = metricCall(intentLower, parsed.timeWindowDays);
+  const metric = metricCall(intentLower, explicitRangeDays(objective));
   const minDealValue = parseRequestedMinimumDealValue(objective) ?? DEFAULT_MIN_DEAL_VALUE;
   const requestedCalendarParams = calendarParams(objective);
   const factsRequired: string[] = [];
@@ -180,7 +493,7 @@ export function planBusinessGoal(parsed: ParsedGoal): InvestigationPlan {
     initialCalls.push({
       tool: "crm", action,
       params: action === "listInactiveLeads"
-        ? { minDaysInactive: parsed.timeWindowDays, minDealValue }
+        ? { minDaysInactive: inactivityDays!, minDealValue }
         : { minDealValue },
       purpose: "Establish the matching CRM records before investigating any related source."
     });
@@ -266,6 +579,11 @@ export function planBusinessGoal(parsed: ParsedGoal): InvestigationPlan {
   };
 }
 
+function boundedContactCalendarParams(params: Record<string, unknown>): Record<string, unknown> {
+  const { queryTerm: _queryTerm, ...dateRange } = params;
+  return dateRange;
+}
+
 function finalText(plan: InvestigationPlan, observations: readonly ToolObservation[], error?: string): string {
   const crmObservation = observations.find(({ tool, action }) => tool === "crm" && ["listInactiveLeads", "listActiveHighValueLeads", "searchLeads"].includes(action));
   if (crmObservation?.result.success && Array.isArray(crmObservation.result.data) && crmObservation.result.data.length === 0 && observations.length === 1) {
@@ -319,15 +637,63 @@ function finalText(plan: InvestigationPlan, observations: readonly ToolObservati
       }
       continue;
     }
+    if (observation.tool === "crm" && observation.action === "resolveContact" && observation.result.success) {
+      const resolution = asContactResolution(observation.result.data);
+      if (!resolution) {
+        lines.push(`FACT: CRM returned an invalid contact-resolution result; no connected source was queried [evidence: ${evidenceRef}].`);
+      } else if (resolution.status === "NOT_FOUND") {
+        lines.push(`FACT: No matching CRM contact was found for "${resolution.query}" [evidence: ${evidenceRef}].`);
+      } else if (resolution.status === "AMBIGUOUS") {
+        const choices = resolution.candidates.map(({ canonicalName, company }) => `${canonicalName} (${company})`).join("; ");
+        lines.push(`FACT: CRM identity is ambiguous. Possible contacts: ${choices}. Please clarify which contact you mean [evidence: ${evidenceRef}].`);
+      } else {
+        lines.push(`FACT: Resolved ${resolution.entity.canonicalName} at ${resolution.entity.company} in CRM using ${resolution.entity.matchedBy} (confidence ${resolution.entity.confidence.toFixed(2)}) [evidence: ${evidenceRef}].`);
+      }
+      continue;
+    }
     if (!observation.result.success) {
       lines.push(`FACT: ${observation.tool}.${observation.action} did not confirm success (${observation.result.error.code}) [evidence: ${evidenceRef}].`);
     } else if (Array.isArray(observation.result.data) && observation.result.data.length === 0) {
       if (observation.tool === "email" && observation.action === "getUnansweredMessages") lines.push(`FACT: No unanswered email messages were found [evidence: ${evidenceRef}].`);
-      else if (observation.tool === "email") lines.push(`FACT: No email history was found for the requested CRM-matched candidates [evidence: ${evidenceRef}].`);
+      else if (observation.tool === "email") lines.push(`FACT: I couldn't find evidence of a matching email conversation in the connected Gmail results; this does not prove that no reply exists [evidence: ${evidenceRef}].`);
+      else if (observation.tool === "calendar" && observation.action === "findEventsForLead") lines.push(`FACT: No Calendar event with the CRM-resolved contact as an attendee was found in the requested date range [evidence: ${evidenceRef}].`);
       else if (observation.tool === "calendar") lines.push(`FACT: No matching calendar availability was found [evidence: ${evidenceRef}].`);
       else if (observation.tool === "tasks") lines.push(`FACT: No matching open tasks were found [evidence: ${evidenceRef}].`);
       else if (observation.tool === "analytics") lines.push(`FACT: No matching metrics were returned [evidence: ${evidenceRef}].`);
       else lines.push(`FACT: No matching records were found [evidence: ${evidenceRef}].`);
+    } else if (observation.tool === "email" && observation.action === "getEmailHistory" && Array.isArray(observation.result.data)) {
+      const messages = observation.result.data.flatMap((value) => {
+        if (!value || typeof value !== "object") return [];
+        const message = value as Record<string, unknown>;
+        return typeof message.direction === "string" ? [message] : [];
+      });
+      const replied = messages.filter(({ direction, responseStatus }) => direction === "OUTBOUND" && responseStatus === "ANSWERED");
+      const inbound = messages.filter(({ direction }) => direction === "INBOUND");
+      if (replied.length) {
+        lines.push(`FACT: Gmail contains ${replied.length} outbound conversation(s) with a later reply attributed to the CRM-resolved contact by exact sender address [evidence: ${evidenceRef}].`);
+      } else if (inbound.length) {
+        lines.push(`FACT: Gmail returned ${inbound.length} inbound message(s) from the CRM-resolved contact, but no matching outbound proposal thread was verified [evidence: ${evidenceRef}].`);
+      } else {
+        lines.push(`FACT: I couldn't find evidence of a reply from the CRM-resolved contact in the matching Gmail results; no claim is made that they never replied [evidence: ${evidenceRef}].`);
+      }
+      for (const [messageIndex, message] of messages.entries()) {
+        const details = [
+          message.direction === "INBOUND" ? "message from the resolved contact" : message.direction === "OUTBOUND" ? "outbound message" : undefined,
+          typeof message.subject === "string" ? `subject "${message.subject}"` : undefined,
+          typeof message.sentAt === "string" ? `date ${message.sentAt}` : undefined
+        ].filter(Boolean);
+        if (details.length) lines.push(`FACT: Gmail conversation message ${messageIndex + 1}: ${details.join("; ")} [evidence: ${evidenceRef}].`);
+      }
+    } else if (observation.tool === "calendar" && observation.action === "findEventsForLead" && Array.isArray(observation.result.data)) {
+      const events = observation.result.data.flatMap((value) => {
+        if (!value || typeof value !== "object") return [];
+        const event = value as Record<string, unknown>;
+        return typeof event.title === "string" && typeof event.startTime === "string" ? [event] : [];
+      });
+      lines.push(`FACT: Calendar returned ${events.length} event(s) with the CRM-resolved contact as an exact attendee match${events.length ? " within the requested date range" : ""} [evidence: ${evidenceRef}].`);
+      for (const event of events) {
+        lines.push(`FACT: Meeting "${event.title}" starts ${String(event.startTime)}${typeof event.endTime === "string" ? ` and ends ${event.endTime}` : ""} [evidence: ${evidenceRef}].`);
+      }
     } else if (observation.tool === "crm" && Array.isArray(observation.result.data) && observation.result.success) {
       const records = observation.result.data;
       const crmAction = observation.action === "listInactiveLeads" ? "inactive high-value" : observation.action === "listActiveHighValueLeads" ? "active high-value" : "high-value";
@@ -378,6 +744,50 @@ function finalText(plan: InvestigationPlan, observations: readonly ToolObservati
 function isLeadRecord(value: unknown): value is { email: string; name?: string } {
   return typeof value === "object" && value !== null && "email" in value &&
     typeof (value as { email?: unknown }).email === "string" && (value as { email: string }).email.includes("@");
+}
+
+function chunks<T>(values: readonly T[], size: number): T[][] {
+  const result: T[][] = [];
+  for (let offset = 0; offset < values.length; offset += size) result.push(values.slice(offset, offset + size));
+  return result;
+}
+
+type CRMResolutionResult =
+  | { status: "RESOLVED"; entity: { email: string; canonicalName: string; company: string; confidence: number; matchedBy: string } }
+  | { status: "AMBIGUOUS"; candidates: Array<{ canonicalName: string; company: string; confidence: number; matchedBy: string }> }
+  | { status: "NOT_FOUND"; query: string };
+
+function asContactResolution(value: unknown): CRMResolutionResult | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const result = value as Record<string, unknown>;
+  if (result.status === "NOT_FOUND" && typeof result.query === "string") {
+    return { status: "NOT_FOUND", query: result.query };
+  }
+  if (result.status === "AMBIGUOUS" && Array.isArray(result.candidates)) {
+    const candidates = result.candidates.flatMap((candidate) => {
+      if (!candidate || typeof candidate !== "object") return [];
+      const item = candidate as Record<string, unknown>;
+      return typeof item.canonicalName === "string" && typeof item.company === "string" &&
+        typeof item.confidence === "number" && typeof item.matchedBy === "string"
+        ? [{ canonicalName: item.canonicalName, company: item.company, confidence: item.confidence, matchedBy: item.matchedBy }]
+        : [];
+    });
+    return candidates.length ? { status: "AMBIGUOUS", candidates } : undefined;
+  }
+  if (result.status === "RESOLVED" && result.entity && typeof result.entity === "object") {
+    const entity = result.entity as Record<string, unknown>;
+    if (typeof entity.email === "string" && typeof entity.canonicalName === "string" &&
+        typeof entity.company === "string" && typeof entity.confidence === "number" && typeof entity.matchedBy === "string") {
+      return {
+        status: "RESOLVED",
+        entity: {
+          email: entity.email, canonicalName: entity.canonicalName, company: entity.company,
+          confidence: entity.confidence, matchedBy: entity.matchedBy
+        }
+      };
+    }
+  }
+  return undefined;
 }
 
 export class RunToolCallTracker {
@@ -431,6 +841,27 @@ export class ControlledAgentOrchestrator {
         break;
       }
 
+      if (call.tool === "crm" && call.action === "resolveContact") {
+        const resolution = asContactResolution(result.data);
+        if (!resolution) {
+          stopError = "crm.resolveContact returned an invalid resolution result";
+          break;
+        }
+        if (resolution.status !== "RESOLVED") continue;
+        for (const dependentCall of plan.dependentCalls ?? []) {
+          const dependentParams = dependentCall.tool === "email" || dependentCall.tool === "calendar"
+            ? { ...dependentCall.params, leadEmail: resolution.entity.email }
+            : dependentCall.params;
+          const dependentResult = await callTool({ ...dependentCall, params: dependentParams });
+          if (!dependentResult.success) {
+            stopError = `${dependentCall.tool}.${dependentCall.action} returned ${dependentResult.error.code}`;
+            break;
+          }
+        }
+        if (stopError) break;
+        continue;
+      }
+
       if (call.tool === "crm" && ["listInactiveLeads", "listActiveHighValueLeads", "searchLeads"].includes(call.action)) {
         if (!Array.isArray(result.data)) {
           stopError = `${call.tool}.${call.action} returned an invalid record collection`;
@@ -465,12 +896,15 @@ export class ControlledAgentOrchestrator {
         }
 
         if (plan.downstream.emailHistoryForCandidates) {
-          const emailCall: PlannedToolCall = {
-            tool: "email", action: plan.downstream.emailAction, params: { leadEmails: uniqueEmails },
-            purpose: "Inspect email history only for lead emails returned by the CRM query."
-          };
-          const emailResult = await callTool(emailCall);
-          if (!emailResult.success) { stopError = `email.getEmailHistory returned ${emailResult.error.code}`; break; }
+          for (const emailChunk of chunks(uniqueEmails, 25)) {
+            const emailCall: PlannedToolCall = {
+              tool: "email", action: plan.downstream.emailAction, params: { leadEmails: emailChunk },
+              purpose: "Inspect email history only for lead emails returned by the CRM query."
+            };
+            const emailResult = await callTool(emailCall);
+            if (!emailResult.success) { stopError = `email.getEmailHistory returned ${emailResult.error.code}`; break; }
+          }
+          if (stopError) break;
         }
 
         if (plan.downstream.sendFollowUpForCandidates) {
@@ -514,7 +948,12 @@ export class ControlledAgentOrchestrator {
         for (const dependentCall of plan.dependentCalls ?? []) {
           let dependentParams = { ...dependentCall.params };
           if (dependentCall.tool === "email" && ["getEmailHistory", "getUnansweredMessages"].includes(dependentCall.action)) {
-            dependentParams = { ...dependentParams, leadEmails: uniqueEmails };
+            for (const emailChunk of chunks(uniqueEmails, 25)) {
+              const emailResult = await callTool({ ...dependentCall, params: { ...dependentParams, leadEmails: emailChunk } });
+              if (!emailResult.success) { stopError = `email.${dependentCall.action} returned ${emailResult.error.code}`; break; }
+            }
+            if (stopError) break;
+            continue;
           } else if (dependentCall.tool === "calendar" && dependentCall.action === "findEventsForLead") {
             for (const leadEmail of uniqueEmails) {
               const result = await callTool({ ...dependentCall, params: { ...dependentParams, leadEmail } });

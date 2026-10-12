@@ -1,13 +1,14 @@
-import { AgentState, ParsedGoal, StepStatus, ToolExecutionContext } from "@nexusops/shared-types";
+import { AgentState, AgentPlan, ParsedGoal, StepStatus, ToolExecutionContext } from "@nexusops/shared-types";
 import { AgentStateMachine } from "../state/stateMachine.js";
 import { getLLMProvider } from "../llm/unifiedLLM.js";
 import { ACTION_TOOL_ACTIONS, ToolOrchestrator } from "../../tools/index.js";
 import { SocketManager } from "../../sockets/socketManager.js";
-import { buildEvidenceReport } from "../policies/dataIntegrity.js";
+import { buildEvidenceReport, validateGroundedAnswer } from "../policies/dataIntegrity.js";
 import { PolicyEngine } from "../policies/policyEngine.js";
 import { ControlledAgentOrchestrator, InvestigationPlan, planBusinessGoal, PlannedToolCall } from "./controlledOrchestrator.js";
 import { ApprovalActionWorkflow, ActionProposal } from "./approvalWorkflow.js";
 import { runTraceStore } from "./runTrace.js";
+import { deterministicQueryAnalysis } from "../queryAnalysis.js";
 
 export class AgentEngine {
   private readonly stateMachine: AgentStateMachine;
@@ -32,19 +33,34 @@ export class AgentEngine {
       traceStarted = true;
       await this.stateMachine.transitionTo(AgentState.GOAL_RECEIVED, "Goal prompt received");
       const parsedGoal = await this.llmProvider.parseGoal(rawPrompt);
-      await this.stateMachine.transitionTo(AgentState.GOAL_PARSED, "Goal parsed into structured specifications", { parsedGoal });
+      const queryPlan = this.llmProvider.analyzeQuery
+        ? await this.llmProvider.analyzeQuery(rawPrompt)
+        : deterministicQueryAnalysis(rawPrompt);
+      await this.stateMachine.transitionTo(AgentState.GOAL_PARSED, "Goal parsed into structured specifications", { parsedGoal, queryPlan });
       await this.stateMachine.transitionTo(AgentState.OBSERVING, "Preparing a tool-backed investigation");
       await this.stateMachine.transitionTo(AgentState.ANALYZING, "Mapping required facts to business tools");
       await this.stateMachine.transitionTo(AgentState.PLANNING, "Building a result-gated investigation plan");
 
-      const plan = planBusinessGoal(parsedGoal);
-      this.emitPlan(plan, parsedGoal);
+      const plan = planBusinessGoal(parsedGoal, queryPlan);
+      this.emitPlan(plan, parsedGoal, queryPlan);
       const orchestrator = new ControlledAgentOrchestrator(async (call, context) => this.executeToolCall(call, context));
       const baseContext = { goalId: this.goalId, runId: this.runId, userId: this.userId, orgId: this.orgId };
       const run = await orchestrator.run(parsedGoal, baseContext, plan);
 
-      const report = buildEvidenceReport(run.observations);
-      SocketManager.emitEvent("agent.report", { runId: this.runId, goalId: this.goalId, report, finalText: run.finalText });
+      const report = buildEvidenceReport(run.observations, queryPlan.sources);
+      const generated = run.status === "completed" && report.bundle.sufficiency === "SUPPORTED" && this.llmProvider.generateGroundedAnswer
+        ? await this.llmProvider.generateGroundedAnswer(rawPrompt, report.bundle)
+        : undefined;
+      const groundedAnswer = validateGroundedAnswer(
+        generated?.kind === "generated" ? generated.candidate : undefined,
+        report.bundle,
+        report.FACT,
+        generated?.kind === "unavailable" ? generated.reason : "not_generated"
+      );
+      SocketManager.emitEvent("agent.report", {
+        runId: this.runId, goalId: this.goalId, report,
+        finalText: groundedAnswer.answer, groundedAnswer
+      });
 
       if (run.status === "completed") {
         await this.stateMachine.transitionTo(AgentState.VERIFYING, "Checking final text against tool evidence");
@@ -56,15 +72,16 @@ export class AgentEngine {
           goalId: this.goalId,
           completedAt: new Date().toISOString(),
           toolCallCount: run.observations.length,
-          finalText: run.finalText,
-          report
+          finalText: groundedAnswer.answer,
+          report,
+          groundedAnswer
         });
         runTraceStore.finishRun(this.runId, "COMPLETED");
       } else {
         const error = run.error ?? "Investigation did not complete.";
         await this.stateMachine.transitionTo(AgentState.FAILED, error, { toolCallCount: run.observations.length });
         SocketManager.emitEvent("agent.goal.failed", {
-          runId: this.runId, goalId: this.goalId, error, finalText: run.finalText, report
+          runId: this.runId, goalId: this.goalId, error, finalText: groundedAnswer.answer, report, groundedAnswer
         });
         runTraceStore.finishRun(this.runId, "FAILED", error);
       }
@@ -175,12 +192,13 @@ export class AgentEngine {
     }
   }
 
-  private emitPlan(plan: InvestigationPlan, parsedGoal: ParsedGoal): void {
+  private emitPlan(plan: InvestigationPlan, parsedGoal: ParsedGoal, queryPlan: AgentPlan): void {
     const steps = plan.initialCalls.map((call, index) => this.toPlanStep(call, index + 1));
     SocketManager.emitEvent("agent.plan.created", {
       runId: this.runId,
       goalId: this.goalId,
       objective: plan.objective,
+      queryPlan,
       factsRequired: plan.factsRequired,
       toolMappings: plan.toolMappings,
       gatedFollowUps: plan.downstream,

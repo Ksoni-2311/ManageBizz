@@ -9,6 +9,13 @@ export const runAgent = async (req: AuthenticatedRequest, res: Response): Promis
     res.status(400).json({ success: false, error: "A non-empty goal is required." });
     return;
   }
+  const timezone = req.body?.timezone;
+  if (timezone !== undefined) {
+    if (typeof timezone !== "string" || !timezone.trim() || !isIanaTimezone(timezone.trim())) {
+      res.status(400).json({ success: false, error: { code: "INVALID_TIMEZONE", message: "A valid IANA timezone is required." } });
+      return;
+    }
+  }
   if (!req.user?.orgId || !req.user.userId) {
     res.status(403).json({ success: false, error: "An organization-scoped session is required." });
     return;
@@ -18,9 +25,21 @@ export const runAgent = async (req: AuthenticatedRequest, res: Response): Promis
     res.status(400).json({ success: false, error: { code: "INVALID_WORKSPACE", message: "A valid ManageBizz workspace identifier is required." } });
     return;
   }
-  const result = await manageBizzAgentApi.run({ goal: goal.trim(), orgId, userId: req.user.userId });
+  const result = await manageBizzAgentApi.run({
+    goal: goal.trim(), orgId, userId: req.user.userId,
+    ...(typeof timezone === "string" ? { timezone: timezone.trim() } : {})
+  });
   res.json({ success: true, ...result });
 };
+
+function isIanaTimezone(value: string): boolean {
+  try {
+    new Intl.DateTimeFormat("en-US", { timeZone: value });
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 export const getAgentRun = async (req: AuthenticatedRequest, res: Response): Promise<void> => {
   const orgId = req.user ? resolveWorkspaceScope(req) : undefined;

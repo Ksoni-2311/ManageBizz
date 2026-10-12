@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { ParsedGoal, ToolResponse } from "@nexusops/shared-types";
 import { ControlledAgentOrchestrator, parseRequestedMinimumDealValue, PlannedToolCall, planBusinessGoal, RunToolCallTracker } from "../agent/runtime/controlledOrchestrator.js";
+import { deterministicQueryAnalysis } from "../agent/queryAnalysis.js";
 
 const context = { goalId: "goal", runId: "controlled-test", userId: "user", orgId: "org" };
 const goal = (objective: string): ParsedGoal => ({ objective, timeWindowDays: 30, constraints: [], successCriteria: [] });
@@ -13,7 +14,7 @@ describe("controlled investigation orchestration", () => {
       called.push(`${call.tool}.${call.action}`);
       return { success: true, data: [] };
     });
-    const result = await orchestrator.run(goal("Find inactive high-value leads and inspect email history for follow-up recommendations"), context);
+    const result = await orchestrator.run(goal("Find inactive high-value leads from the last 30 days and inspect email history for follow-up recommendations"), context);
     assert.deepEqual(called, ["crm.listInactiveLeads"]);
     assert.equal(result.status, "completed");
     assert.match(result.finalText, /No inactive high-value leads were found/);
@@ -25,7 +26,7 @@ describe("controlled investigation orchestration", () => {
     const result = await new ControlledAgentOrchestrator(async (call) => {
       calls.push(`${call.tool}.${call.action}`);
       return { success: true, data: [] };
-    }).run(goal("Follow up with all inactive high-value leads"), context);
+    }).run(goal("Follow up with all inactive high-value leads from the last 30 days"), context);
     assert.deepEqual(calls, ["crm.listInactiveLeads"]);
     assert.equal(result.status, "completed");
     assert.match(result.finalText, /No inactive high-value leads were found/);
@@ -51,10 +52,10 @@ describe("controlled investigation orchestration", () => {
         : [];
       return { success: true, data };
     });
-    const result = await orchestrator.run(goal("Find inactive high-value leads and inspect email history for follow-up recommendations"), context);
+    const result = await orchestrator.run(goal("Find inactive high-value leads from the last 30 days and inspect email history for follow-up recommendations"), context);
     assert.deepEqual(calls.map(({ tool, action }) => `${tool}.${action}`), ["crm.listInactiveLeads", "email.getEmailHistory"]);
     assert.deepEqual(calls[1]!.params, { leadEmails: ["one@example.test", "two@example.test"] });
-    assert.match(result.finalText, /No email history was found for the requested CRM-matched candidates/);
+    assert.match(result.finalText, /couldn't find evidence of a matching email conversation/);
     assert.match(result.finalText, /Insufficient evidence to determine whether follow-up is due/);
     assert.match(result.finalText, /RECOMMENDATION: Review these matching leads.*evidence: crm\.listInactiveLeads#1/);
     assert.doesNotMatch(result.finalText, /was sent|email delivered/i);
@@ -66,7 +67,7 @@ describe("controlled investigation orchestration", () => {
     const result = await new ControlledAgentOrchestrator(async (call) => {
       calls.push(`${call.tool}.${call.action}`);
       return { success: true, data: [{ email: "candidate@example.test" }] };
-    }).run(goal("Find inactive high-value leads"), context);
+    }).run(goal("Find inactive high-value leads from the last 30 days"), context);
     assert.deepEqual(calls, ["crm.listInactiveLeads"]);
     assert.equal(result.status, "completed");
   });
@@ -88,7 +89,7 @@ describe("controlled investigation orchestration", () => {
     const { from, until } = calendarPlan.initialCalls[0]!.params;
     assert.equal(Date.parse(String(until)) - Date.parse(String(from)), 24 * 60 * 60 * 1000);
 
-    const irrelevantPlan = planBusinessGoal(goal("Find my inactive high-value leads."));
+    const irrelevantPlan = planBusinessGoal(goal("Find my inactive high-value leads from the last 30 days."));
     assert.equal(irrelevantPlan.initialCalls.some(({ tool }) => tool === "email" || tool === "calendar"), false);
   });
 
@@ -98,7 +99,7 @@ describe("controlled investigation orchestration", () => {
       calls.push({ label: `${call.tool}.${call.action}`, params: call.params });
       return { success: true, data: call.tool === "crm" ? [{ email: "candidate@example.test" }] : [] };
     });
-    const result = await orchestrator.run(goal("Find inactive high-value leads and check calendar availability for 2026-10-02 for 30 minutes"), context);
+    const result = await orchestrator.run(goal("Find inactive high-value leads from the last 30 days and check calendar availability for 2026-10-02 for 30 minutes"), context);
     assert.deepEqual(calls.map(({ label }) => label), ["crm.listInactiveLeads", "calendar.getAvailability"]);
     assert.deepEqual(calls[1]!.params, { from: "2026-10-02T00:00:00.000Z", until: "2026-10-03T00:00:00.000Z", durationMinutes: 30 });
     assert.equal(result.status, "completed");
@@ -106,8 +107,61 @@ describe("controlled investigation orchestration", () => {
 
   it("preserves an explicitly requested deal-value threshold in the CRM query", () => {
     assert.equal(parseRequestedMinimumDealValue("Find leads with deal value >= $125k"), 125_000);
-    const plan = planBusinessGoal(goal("Find inactive high-value leads with at least ₹1 lakh deal value"));
+    const plan = planBusinessGoal(goal("Find inactive high-value leads from the last 30 days with at least ₹1 lakh deal value"));
     assert.deepEqual(plan.initialCalls[0]!.params, { minDaysInactive: 30, minDealValue: 100_000 });
+  });
+
+  it("resolves a CRM identity before bounded exact-identity Gmail and Calendar retrieval", async () => {
+    const prompt = "Did Rahul reply to my proposal, and do I have a meeting with him next week?";
+    const queryPlan = deterministicQueryAnalysis(prompt, "Asia/Kolkata");
+    const investigation = planBusinessGoal(goal(prompt), queryPlan, "Asia/Kolkata");
+    const calls: Array<{ tool: string; action: string; params: Record<string, unknown> }> = [];
+    const result = await new ControlledAgentOrchestrator(async (call) => {
+      calls.push({ tool: call.tool, action: call.action, params: call.params });
+      if (call.action === "resolveContact") {
+        return { success: true, data: { status: "RESOLVED", entity: {
+          entityType: "person", crmRecordRef: "private-crm-id", canonicalName: "Rahul Sharma",
+          company: "Acme", email: "rahul@acme.test", confidence: 0.97, matchedBy: "exact_name"
+        } } };
+      }
+      if (call.tool === "email") {
+        return { success: true, data: [
+          { id: "outbound-id", threadId: "thread-1", leadEmail: "rahul@acme.test", direction: "OUTBOUND", responseStatus: "ANSWERED", subject: "Proposal", sentAt: "2026-09-01T10:00:00.000Z" },
+          { id: "reply-id", threadId: "thread-1", leadEmail: "rahul@acme.test", senderEmail: "rahul@acme.test", direction: "INBOUND", responseStatus: "INBOUND", subject: "Re: Proposal", sentAt: "2026-09-02T10:00:00.000Z" }
+        ] };
+      }
+      return { success: true, data: [
+        { id: "event-id", title: "Proposal review", attendees: ["rahul@acme.test"], startTime: "2026-10-05T10:00:00.000Z", endTime: "2026-10-05T10:30:00.000Z", status: "SCHEDULED" }
+      ] };
+    }).run(goal(prompt), context, investigation);
+
+    assert.deepEqual(calls.map(({ tool, action }) => `${tool}.${action}`), [
+      "crm.resolveContact", "email.getEmailHistory", "calendar.findEventsForLead"
+    ]);
+    assert.equal(calls[1]?.params.leadEmail, "rahul@acme.test");
+    assert.equal(calls[2]?.params.leadEmail, "rahul@acme.test");
+    assert.equal("queryTerm" in (calls[2]?.params ?? {}), false);
+    assert.ok(typeof calls[2]?.params.from === "string" && typeof calls[2]?.params.until === "string");
+    assert.match(result.finalText, /Resolved Rahul Sharma/);
+    assert.match(result.finalText, /reply attributed to the CRM-resolved contact by exact sender address/);
+    assert.match(result.finalText, /Proposal review/);
+  });
+
+  it("stops dependent source lookups when CRM resolution is ambiguous", async () => {
+    const prompt = "Did Rahul reply to my proposal, and do I have a meeting with him next week?";
+    const queryPlan = deterministicQueryAnalysis(prompt, "Asia/Kolkata");
+    const investigation = planBusinessGoal(goal(prompt), queryPlan, "Asia/Kolkata");
+    const calls: string[] = [];
+    const result = await new ControlledAgentOrchestrator(async (call) => {
+      calls.push(`${call.tool}.${call.action}`);
+      return { success: true, data: { status: "AMBIGUOUS", candidates: [
+        { crmRecordRef: "private-1", canonicalName: "Rahul Sharma", company: "Acme", confidence: 0.72, matchedBy: "name_component" },
+        { crmRecordRef: "private-2", canonicalName: "Rahul Verma", company: "Other", confidence: 0.72, matchedBy: "name_component" }
+      ] } };
+    }).run(goal(prompt), context, investigation);
+    assert.deepEqual(calls, ["crm.resolveContact"]);
+    assert.match(result.finalText, /identity is ambiguous/);
+    assert.match(result.finalText, /Please clarify/);
   });
 
   it("routes generic high-value requests through CRM and preserves rupee thresholds", async () => {
@@ -120,19 +174,20 @@ describe("controlled investigation orchestration", () => {
     assert.deepEqual(threshold.initialCalls[0]!.params, { minDealValue: 1_000_000 });
   });
 
-  it("maps attention and follow-up questions to the deterministic inactive high-value query", () => {
-    for (const objective of ["Which leads need my attention?", "Why do they need attention?", "Why do these leads need follow-up?"]) {
-      const plan = planBusinessGoal(goal(objective));
-      assert.equal(plan.initialCalls[0]?.tool, "crm");
-      assert.equal(plan.initialCalls[0]?.action, "listInactiveLeads");
-      assert.deepEqual(plan.initialCalls[0]?.params, { minDaysInactive: 30, minDealValue: 25_000 });
+  it("does not infer high-value or an inactivity window from vague attention language", () => {
+    for (const objective of ["Which leads need my attention?", "Why do they need attention?"]) {
+      assert.deepEqual(planBusinessGoal(goal(objective)).initialCalls, []);
     }
+    assert.throws(
+      () => planBusinessGoal(goal("Find inactive high-value leads")),
+      /does not specify one; no date range was invented/
+    );
   });
 
-  it("resolves a follow-up task request for them through CRM before proposing tasks", () => {
+  it("does not infer high-value criteria for a deictic follow-up task request", () => {
     const plan = planBusinessGoal(goal("Create follow-up tasks for them."));
-    assert.deepEqual(plan.initialCalls.map(({ tool, action }) => `${tool}.${action}`), ["crm.listInactiveLeads"]);
-    assert.equal(plan.downstream.createFollowUpTasksForCandidates, true);
+    assert.deepEqual(plan.initialCalls, []);
+    assert.equal(plan.downstream.createFollowUpTasksForCandidates, false);
   });
 
   it("reports only CRM-returned high-value records with linked evidence", async () => {
@@ -167,7 +222,7 @@ describe("controlled investigation orchestration", () => {
       calls.push(`${call.tool}.${call.action}`);
       return { success: false, error: { code: "DATA_UNAVAILABLE", message: "CRM unavailable" } };
     });
-    const result = await orchestrator.run(goal("Find inactive high-value leads and inspect email history"), context);
+    const result = await orchestrator.run(goal("Find inactive high-value leads from the last 30 days and inspect email history"), context);
     assert.deepEqual(calls, ["crm.listInactiveLeads"]);
     assert.equal(result.status, "failed");
     assert.match(result.finalText, /insufficient/i);
@@ -183,8 +238,8 @@ describe("controlled investigation orchestration", () => {
 
   it("completes an empty-result investigation with concise final text and a minimal plan", async () => {
     const result = await new ControlledAgentOrchestrator(async (): Promise<ToolResponse> => ({ success: true, data: [] }))
-      .run(goal("Find inactive high-value leads"), context);
-    const plan = planBusinessGoal(goal("Find inactive high-value leads"));
+      .run(goal("Find inactive high-value leads from the last 30 days"), context);
+    const plan = planBusinessGoal(goal("Find inactive high-value leads from the last 30 days"));
     assert.equal(result.status, "completed");
     assert.ok(result.finalText.trim().length > 0);
     assert.equal(result.observations.length, 1);

@@ -26,7 +26,9 @@ describe("Google Calendar provider architecture", () => {
     ]);
     const calendar = new CalendarToolService({ clock: () => new Date("2026-09-30T00:00:00Z"), provider });
     const upcoming = await calendar.listUpcomingEvents({}, context);
-    const relevant = await calendar.findEventsForLead({ leadEmail: "lead@example.test" }, context);
+    const relevant = await calendar.findEventsForLead({
+      leadEmail: "lead@example.test", from: "2026-10-01T00:00:00.000Z", until: "2026-10-02T00:00:00.000Z"
+    }, context);
     const detail = await calendar.getMeeting({ meetingId: "event-1" }, context);
     assert.equal(upcoming.success && upcoming.data.length, 2);
     assert.deepEqual(relevant.success && relevant.data.map(({ id }) => id), ["event-1"]);
@@ -119,8 +121,8 @@ describe("Google Calendar provider architecture", () => {
           assert.equal(init?.method, "POST");
           return new Response(JSON.stringify({ access_token: "temporary-access", refresh_token: "long-lived-refresh" }), { status: 200 });
         }
-        assert.equal(String(input), "https://www.googleapis.com/calendar/v3/calendars/primary");
-        return new Response(JSON.stringify({ id: "primary" }), { status: 200 });
+        assert.equal(String(input), "https://www.googleapis.com/calendar/v3/calendars/primary/events?maxResults=1&showDeleted=false");
+        return new Response(JSON.stringify({ items: [] }), { status: 200 });
       };
       const oauth = new GoogleCalendarOAuthService(repository, fetcher);
       const authorizationUrl = new URL(oauth.authorizationUrl(identity));

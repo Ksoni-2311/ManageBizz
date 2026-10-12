@@ -12,7 +12,7 @@ const validLead = { id: "l1", name: "Lead", email: "lead@example.test", company:
 describe("business tool contracts", () => {
   it("validates CRM inputs and represents no matches as an empty success", async () => {
     const crm = new CRMToolService({ clock: () => new Date("2026-09-01T00:00:00Z") });
-    crm.setLeads([validLead], "org");
+    crm.setLeads([validLead], "org", "u");
     const found = await crm.listActiveHighValueLeads({ minDealValue: 999_999 }, ctx);
     assert.equal(found.success, true);
     if (found.success) assert.deepEqual(found.data, []);

@@ -21,7 +21,7 @@ export const ToolsRegistry = {
 
 /** Explicit capability lists keep read-only queries separate from mutations. */
 export const READ_ONLY_TOOL_ACTIONS: Readonly<Record<string, readonly string[]>> = {
-  crm: ["listActiveHighValueLeads", "listInactiveLeads", "searchLeads"],
+  crm: ["listActiveHighValueLeads", "listInactiveLeads", "searchLeads", "resolveContact"],
   email: ["getEmailHistory", "getUnansweredMessages", "getEmailMetadata", "getEmailContent"],
   calendar: ["getAvailability", "getMeeting", "listUpcomingEvents", "findEventsForLead"],
   analytics: ["getLeadMetrics", "getConversionMetrics", "getSalesMetrics", "getActivityMetrics"],
@@ -143,17 +143,6 @@ export class ToolOrchestrator {
       if (begin.status === "CACHED") return withCacheMetadata(begin.result, context.actionId);
       if (begin.status === "IN_PROGRESS") return fail("ACTION_IN_PROGRESS", "This action has already been claimed and will not be executed a second time.", context);
       if (begin.status === "CONFLICT") return fail("ACTION_ID_CONFLICT", "This action ID is already associated with a different owner or action.", context);
-    } else {
-      // Preserve read-call idempotency when storage is available; reads remain safe to retry on storage errors.
-      try {
-        const existing = await ToolExecutionModel.findOne({ actionId: context.actionId, orgId: context.orgId, userId: context.userId }).lean();
-        if (existing) {
-          const existingParams = (existing.params ?? {}) as Record<string, unknown>;
-          const cachedKey = emptyToolCallKey(existing.runId, context.orgId, existing.tool, existing.action, existingParams);
-          if (existing.runId !== context.runId || cachedKey !== signature) return fail("ACTION_ID_CONFLICT", "This action ID is already associated with a different tool call.", context);
-          return { success: true, data: existing.result, metadata: { executionTimeMs: 0, actionId: context.actionId, cached: true } };
-        }
-      } catch { /* Read-only calls remain available when optional idempotency storage is offline. */ }
     }
 
     const toolInstance = (registry as unknown as Record<string, Record<string, unknown>>)[toolName];
@@ -171,15 +160,6 @@ export class ToolOrchestrator {
     if (isMutation) {
       try { await actionStore.finish(idempotencyInput, result); }
       catch { return fail("ACTION_RESULT_UNRECORDED", "The action result could not be safely recorded. Do not retry this action automatically.", context); }
-    } else if (result.success) {
-      try {
-        await ToolExecutionModel.create({
-          orgId: context.orgId, userId: context.userId, actionId: context.actionId,
-          goalId: context.goalId, runId: context.runId, stepId: context.actionId,
-          tool: toolName, action, params, result: result.data,
-          paramsHash: hashParams(params), executionStatus: "SUCCEEDED", executedAt: new Date()
-        });
-      } catch { /* Read-only results must not fail because best-effort caching is unavailable. */ }
     }
     const metadata = { ...result.metadata, executionTimeMs: Date.now() - startedAt, actionId: context.actionId };
     return { ...result, metadata };

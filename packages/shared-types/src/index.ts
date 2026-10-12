@@ -1,5 +1,6 @@
 export * from "./agent.js";
 export * from "./goal.js";
+export * from "./agentResult.js";
 export * from "./plan.js";
 export * from "./tools.js";
 export * from "./approval.js";

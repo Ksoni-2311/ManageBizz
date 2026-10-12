@@ -4,7 +4,7 @@ import { GoogleProviderError } from "../googleOAuth/googleProviderError.js";
 import { gmailApiError, healthForGmailError } from "./gmailApiError.js";
 
 export type EmailIdentity = { workspaceId: string; userId: string };
-export type ProviderEmail = { id: string; threadId?: string | undefined; leadEmail?: string | undefined; direction: "INBOUND" | "OUTBOUND"; subject?: string | undefined; sentAt?: string | undefined; inReplyToMessageId?: string | undefined; messageId?: string | undefined };
+export type ProviderEmail = { id: string; threadId?: string | undefined; leadEmail?: string | undefined; senderEmail?: string | undefined; direction: "INBOUND" | "OUTBOUND"; subject?: string | undefined; sentAt?: string | undefined; inReplyToMessageId?: string | undefined; messageId?: string | undefined };
 export type EmailSearch = { leadEmail?: string | undefined; leadEmails?: string[] | undefined; query?: string | undefined };
 export type EmailContent = { id: string; threadId?: string; from?: string; to?: string; subject?: string; sentAt?: string; body: string };
 export type EmailDraftInput = { to: string; subject: string; body: string };
@@ -84,9 +84,11 @@ export class GmailProvider implements EmailProvider {
   }
   async search(identity: EmailIdentity, criteria: EmailSearch): Promise<ProviderEmail[]> {
     const q = buildQuery(criteria), token = await this.accessToken(identity), threads = new Set<string>();
+    const targetEmails = criteria.leadEmail ? [criteria.leadEmail.toLocaleLowerCase("en-US")]
+      : criteria.leadEmails?.map((email) => email.toLocaleLowerCase("en-US"));
     let pageToken: string | undefined;
-    for (let page = 0; page < 10; page++) {
-      const query = new URLSearchParams({ q, maxResults: "100", ...(pageToken ? { pageToken } : {}) });
+    for (let page = 0; page < 1; page++) {
+      const query = new URLSearchParams({ q, maxResults: "50", ...(pageToken ? { pageToken } : {}) });
       const response = await this.request(`https://gmail.googleapis.com/gmail/v1/users/me/messages?${query}`, { headers: { Authorization: `Bearer ${token}` } });
       if (!response.ok) throw await this.apiError(identity, response);
       const result = await response.json() as { messages?: Array<{ threadId?: string }>; nextPageToken?: string };
@@ -94,23 +96,33 @@ export class GmailProvider implements EmailProvider {
       pageToken = result.nextPageToken;
       if (!pageToken) break;
     }
-    if (pageToken) throw new GoogleProviderError("EMAIL_RESULT_LIMIT", "Gmail returned more than 1,000 matching messages; narrow the search.", 413);
-    const messages = (await Promise.all([...threads].map(async (threadId) => {
+    if (pageToken) throw new GoogleProviderError("EMAIL_RESULT_LIMIT", "Gmail returned more than 50 matching messages; narrow the search.", 413);
+    const messages: GmailMessage[] = [];
+    const threadIds = [...threads].slice(0, 50);
+    for (let start = 0; start < threadIds.length; start += 10) {
+      const batch = await Promise.all(threadIds.slice(start, start + 10).map(async (threadId) => {
       const params = metadataParams();
       const response = await this.request(`https://gmail.googleapis.com/gmail/v1/users/me/threads/${encodeURIComponent(threadId)}?${params}`, { headers: { Authorization: `Bearer ${token}` } });
       if (!response.ok) throw await this.apiError(identity, response);
       return (await response.json() as GmailThread).messages ?? [];
-    }))).flat();
+      }));
+      messages.push(...batch.flat());
+    }
     await this.markHealth(identity, "verified");
     const ids = new Set(messages.flatMap((message) => message.id ? [message.id] : []));
     return messages.flatMap((message) => {
       if (!message.id) return [];
       const h = headerMap(message), sent = message.labelIds?.includes("SENT") ?? false;
       const from = addresses(h.get("from")), to = [...addresses(h.get("to")), ...addresses(h.get("cc"))];
-      const leadEmail = sent ? to.find((email) => !addresses(h.get("from")).includes(email)) : from[0];
+      const recipients = [...new Set(to.filter((email) => !from.includes(email)))];
+      const matchedRecipients = targetEmails ? recipients.filter((email) => targetEmails.includes(email)) : [];
+      const leadEmail = sent
+        ? targetEmails ? (matchedRecipients.length === 1 ? matchedRecipients[0] : undefined) : recipients[0]
+        : from.find((email) => !targetEmails || targetEmails.includes(email));
       const date = message.internalDate ? new Date(Number(message.internalDate)).toISOString() : validDate(h.get("date"));
       const reply = h.get("in-reply-to")?.replace(/[<>]/g, "").trim();
-      return [{ id: message.id, ...(message.threadId ? { threadId: message.threadId } : {}), ...(leadEmail ? { leadEmail } : {}), direction: sent ? "OUTBOUND" as const : "INBOUND" as const,
+      return [{ id: message.id, ...(message.threadId ? { threadId: message.threadId } : {}), ...(leadEmail ? { leadEmail } : {}),
+        ...(!sent && leadEmail ? { senderEmail: leadEmail } : {}), direction: sent ? "OUTBOUND" as const : "INBOUND" as const,
         ...(h.get("subject") ? { subject: h.get("subject") } : {}), ...(date ? { sentAt: date } : {}), ...(reply && ids.has(reply) ? { inReplyToMessageId: reply } : {}), ...(h.get("message-id") ? { messageId: h.get("message-id") } : {}) }];
     });
   }

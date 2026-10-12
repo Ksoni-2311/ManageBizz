@@ -5,8 +5,8 @@ export class CalendarService {
   listUpcomingEvents(identity: CalendarIdentity, query: CalendarListQuery): Promise<CalendarEvent[]> {
     return this.run(() => this.provider.listUpcomingEvents(identity, query));
   }
-  findEventsForLead(identity: CalendarIdentity, email: string): Promise<CalendarEvent[]> {
-    return this.run(() => this.provider.findEventsForLead(identity, email));
+  findEventsForLead(identity: CalendarIdentity, email: string, query?: CalendarListQuery): Promise<CalendarEvent[]> {
+    return this.run(() => this.provider.findEventsForLead(identity, email, query));
   }
   getEventDetails(identity: CalendarIdentity, eventId: string): Promise<CalendarEvent | undefined> {
     return this.run(() => this.provider.getEventDetails(identity, eventId));

@@ -9,7 +9,9 @@ const availabilitySchema = z.object({
   durationMinutes: z.number().int().positive().max(1440).optional()
 }).strict();
 const meetingLookupSchema = z.object({ meetingId: nonEmpty }).strict();
-const leadLookupSchema = z.object({ leadEmail: emailAddress }).strict();
+const leadLookupSchema = z.object({ leadEmail: emailAddress, from: z.string().datetime().optional(), until: z.string().datetime().optional() }).strict()
+  .refine(({ from, until }) => !from || !until || Date.parse(until) > Date.parse(from), { path: ["until"], message: "until must be later than from" })
+  .refine(({ from, until }) => !from || !until || Date.parse(until) - Date.parse(from) <= 31 * 24 * 60 * 60 * 1000, { path: ["until"], message: "contact event searches are limited to 31 days" });
 const upcomingSchema = z.object({ from: z.string().datetime().optional(), until: z.string().datetime().optional(), queryTerm: z.string().trim().min(1).max(60).optional() }).strict()
   .refine(({ from, until }) => !from || !until || Date.parse(until) > Date.parse(from), { path: ["until"], message: "until must be later than from" });
 const createMeetingSchema = z.object({
@@ -69,8 +71,14 @@ export class CalendarToolService {
   }
 
   findEventsForLead(params: unknown, context: ToolExecutionContext): Promise<ToolResponse<Meeting[]>> {
-    return runValidated(leadLookupSchema, params, context, async ({ leadEmail }) =>
-      (await this.calendarCall(() => this.service.findEventsForLead(identity(context), leadEmail))).map(cloneEvent));
+    return runValidated(leadLookupSchema, params, context, async ({ leadEmail, from, until }) => {
+      const start = from ?? this.clock().toISOString();
+      const end = until ?? new Date(Date.parse(start) + 31 * 24 * 60 * 60 * 1000).toISOString();
+      if (Date.parse(end) <= Date.parse(start) || Date.parse(end) - Date.parse(start) > 31 * 24 * 60 * 60 * 1000) {
+        throw new ToolDomainError("INVALID_INPUT", "Contact event searches must use a valid range no longer than 31 days.");
+      }
+      return (await this.calendarCall(() => this.service.findEventsForLead(identity(context), leadEmail, { from: start, until: end }))).map(cloneEvent);
+    });
   }
 
   connectionStatus(context: ToolExecutionContext): Promise<{ connected: boolean; reauthorizationRequired?: boolean }> {

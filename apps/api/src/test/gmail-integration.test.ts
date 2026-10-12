@@ -40,6 +40,20 @@ describe("Gmail read integration contracts", () => {
     if (metadata.success) assert.equal(metadata.data?.id, "sent-2");
   });
 
+  it("does not attribute an unrelated inbound message in the same thread to the CRM contact", async () => {
+    const provider = new MockEmailProvider();
+    provider.seed(identity, [
+      { id: "sent-to-lead", threadId: "shared-thread", leadEmail: "lead@example.test", direction: "OUTBOUND", subject: "Proposal", sentAt: "2026-09-01T09:00:00.000Z" },
+      { id: "reply-from-other", threadId: "shared-thread", leadEmail: "other@example.test", direction: "INBOUND", subject: "Re: Proposal", sentAt: "2026-09-02T09:00:00.000Z" }
+    ]);
+    const result = await new EmailToolService(provider).getEmailHistory({ leadEmail: "lead@example.test" }, context);
+    assert.equal(result.success, true);
+    if (result.success) {
+      assert.equal(result.data.length, 1);
+      assert.equal(result.data[0]?.responseStatus, "UNANSWERED");
+    }
+  });
+
   it("isolates fake mailbox data per workspace and never falls back to demo records", async () => {
     const provider = new MockEmailProvider();
     provider.seed(identity, [{ id: "private-message", leadEmail: "lead@example.test", direction: "INBOUND" }]);

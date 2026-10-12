@@ -49,6 +49,11 @@ function isEmptyEvidence(fact: AgentRun["evidence"]["facts"][number]): boolean {
   return fact.outcome === "EMPTY_RESULT";
 }
 
+function formatCRMDate(value: string): string | undefined {
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? undefined : date.toLocaleDateString();
+}
+
 function ActionCard({
   action,
   relatedDraft,
@@ -263,7 +268,8 @@ export default function App() {
     setRequestError(null);
     setRun(null);
     try {
-      const result = await submitGoal(goal.trim());
+      const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+      const result = await submitGoal(goal.trim(), timezone || undefined);
       setRun(result);
     } catch (error) {
       setRequestError(error instanceof Error ? error.message : "The agent request failed.");
@@ -492,23 +498,54 @@ export default function App() {
               <section className="panel result-panel">
                 <div className="section-heading compact"><div><p className="eyebrow">USER GOAL</p><h3>{goal}</h3></div><StatusPill status={run.status} /></div>
                 {run.status === "failed" && <div className="banner banner-error"><AlertCircle size={17} /><div><strong>Agent run failed</strong><span>{run.error?.message ?? "The agent could not complete this run."}</span></div></div>}
-                <div className="answer-box"><span className="answer-label"><Sparkles size={15} /> SUMMARY</span><p>{run.response?.summary || run.answer || "No response was returned by the agent."}</p>{run.response?.evidenceInsufficient && <small className="insufficient-note">Insufficient evidence to determine the requested result.</small>}</div>
-              </section>
-
-              <section className="panel">
-                <div className="panel-title-row"><div><p className="eyebrow">GOAL-DRIVEN EXECUTION</p><h3>Investigation plan</h3></div><span className="count-label">{run.plan?.steps.length ?? 0} {run.plan?.steps.length === 1 ? "step" : "steps"}</span></div>
-                {!run.plan?.steps.length ? <EmptyNotice title="No tool steps selected" detail="The goal did not map to a configured business tool." /> : <ol className="agent-plan-list">{run.plan.steps.map((step, index) => <li className="agent-plan-step" key={`${step.tool}.${step.action}.${index}`}><span className="plan-sequence">{index + 1}</span><div><div className="plan-title"><strong>{step.tool} · {step.action}</strong>{step.dependsOnCRMResults && <span className="dependency-tag">After CRM matches</span>}</div><p>{step.purpose}</p></div></li>)}</ol>}
+                <div className="answer-box"><span className="answer-label"><Sparkles size={15} /> ANSWER</span><p>{run.groundedAnswer?.answer || run.response?.summary || run.answer || "No response was returned by the agent."}</p>{run.response?.evidenceInsufficient && <small className="insufficient-note">{run.groundedAnswer?.status.replace(/_/g, " ").toLocaleLowerCase() ?? "Insufficient evidence"}.</small>}</div>
+                {run.structuredResult?.resultType === "crm_records" && <div className="agent-result">
+                  <div className="agent-result-heading">
+                    <div><p className="eyebrow">CRM RESULTS</p><h4>{run.structuredResult.title}</h4></div>
+                    <span className="count-label">{run.structuredResult.count} {run.structuredResult.count === 1 ? "record" : "records"}</span>
+                  </div>
+                  {run.structuredResult.matchingCriteria.length > 0 && <ul className="result-criteria">{run.structuredResult.matchingCriteria.map((criterion) => <li key={criterion}>{criterion}</li>)}</ul>}
+                  {run.structuredResult.count === 0
+                    ? <p className="result-empty">No CRM records matched the requested criteria.</p>
+                    : run.structuredResult.records.length === 0
+                      ? <p className="result-empty">CRM records were returned, but none had valid displayable fields.</p>
+                      : <div className="agent-result-table-wrap"><table className="agent-result-table"><thead><tr>
+                        {run.structuredResult.records.some(({ name }) => name) && <th>Name</th>}
+                        {run.structuredResult.records.some(({ company }) => company) && <th>Company</th>}
+                        {run.structuredResult.records.some(({ dealValue }) => dealValue !== undefined) && <th>Deal value</th>}
+                        {run.structuredResult.records.some(({ status }) => status) && <th>Status</th>}
+                        {run.structuredResult.records.some(({ lastContactedAt }) => lastContactedAt) && <th>Last contacted</th>}
+                      </tr></thead><tbody>{run.structuredResult.records.map((record) => <tr key={record.recordRef}>
+                        {run.structuredResult?.records.some(({ name }) => name) && <td>{record.name}</td>}
+                        {run.structuredResult?.records.some(({ company }) => company) && <td>{record.company}</td>}
+                        {run.structuredResult?.records.some(({ dealValue }) => dealValue !== undefined) && <td>{record.dealValue === undefined ? "" : new Intl.NumberFormat().format(record.dealValue)}</td>}
+                        {run.structuredResult?.records.some(({ status }) => status) && <td>{record.status}</td>}
+                        {run.structuredResult?.records.some(({ lastContactedAt }) => lastContactedAt) && <td>{record.lastContactedAt ? formatCRMDate(record.lastContactedAt) : ""}</td>}
+                      </tr>)}</tbody></table></div>}
+                  {run.structuredResult.omittedCount > 0 && <p className="result-omitted">{run.structuredResult.omittedCount} returned record(s) could not be displayed because their fields were invalid.</p>}
+                  {run.structuredResult.truncatedCount > 0 && <p className="result-omitted">{run.structuredResult.truncatedCount} additional record(s) were omitted to keep the result bounded.</p>}
+                </div>}
               </section>
 
               <section className="panel">
                 <div className="panel-title-row"><div><p className="eyebrow">SOURCE RESULTS</p><h3>Evidence</h3></div><span className="count-label">{run.evidence.facts.length} {run.evidence.facts.length === 1 ? "item" : "items"}</span></div>
-                {run.evidence.facts.length === 0 ? <EmptyNotice title="No evidence returned" detail="The agent did not receive business facts from its tools for this run." /> : <div className="evidence-list">{run.evidence.facts.map((fact) => <article className="evidence-item" key={fact.evidenceRef}><div className="evidence-top"><span className="source-tag">{fact.tool} · {fact.action}</span><StatusPill status={isEmptyEvidence(fact) ? "EMPTY_RESULT" : fact.outcome} /></div><p>{fact.statement}</p><span className="evidence-ref">{fact.evidenceRef}</span>{fact.error && <div className="inline-error"><AlertCircle size={15} />{fact.error.code}: {fact.error.message}</div>}</article>)}</div>}
+                {run.evidence.facts.length === 0 ? <EmptyNotice title="No evidence returned" detail="The agent did not receive business facts from its tools for this run." /> : <div className="evidence-list">{run.evidence.facts.map((fact) => <article className="evidence-item" key={fact.evidenceRef}><div className="evidence-top"><span className="source-tag">{fact.tool} · {fact.action}</span><StatusPill status={isEmptyEvidence(fact) ? "EMPTY_RESULT" : fact.outcome} /></div><p>{fact.statement}</p><span className="evidence-ref">{fact.evidenceRef}</span>{fact.matchingCriteria?.map((criterion) => <small className="evidence-criterion" key={criterion}>Criteria: {criterion}</small>)}{fact.recordRefs?.map((recordRef) => <small className="evidence-record-ref" key={recordRef}>Record: {recordRef}</small>)}{fact.error && <div className="inline-error"><AlertCircle size={15} />{fact.error.code}: {fact.error.message}</div>}</article>)}</div>}
                 {run.evidence.inferences.length > 0 && <div className="subsection"><h4>Inferences</h4><ul>{run.evidence.inferences.map((item, index) => <li key={`${index}-${item}`}>{item}</li>)}</ul></div>}
               </section>
 
               <section className="panel">
+                <div className="panel-title-row"><div><p className="eyebrow">EVIDENCE QUALITY</p><h3>Limitations</h3></div><span className="count-label">{run.groundedAnswer?.status ?? run.evidence.bundle.sufficiency}</span></div>
+                {run.groundedAnswer?.limitations.length || run.evidence.bundle.limitations.length
+                  ? <ul className="result-criteria">{(run.groundedAnswer?.limitations ?? run.evidence.bundle.limitations).map((item, index) => <li key={`${index}-${item}`}>{item}</li>)}</ul>
+                  : <EmptyNotice title="No known limitations" detail="The requested sources returned evidence for this result." />}
+                {run.evidence.bundle.conflicts.length > 0 && <div className="subsection"><h4>Conflicts</h4><ul>{run.evidence.bundle.conflicts.map((conflict) => <li key={conflict.field}>{conflict.field}: {conflict.values.map(({ source, value }) => `${source} — ${value}`).join("; ")}</li>)}</ul></div>}
+                {run.evidence.bundle.sourceCoverage.length > 0 && <div className="subsection"><h4>Source coverage</h4><ul>{run.evidence.bundle.sourceCoverage.map(({ source, status, retrievalStatus }) => <li key={source}>{source}: {status.replace(/_/g, " ").toLocaleLowerCase()} ({retrievalStatus.replace(/_/g, " ").toLocaleLowerCase()})</li>)}</ul></div>}
+              </section>
+
+              <section className="panel">
                 <div className="panel-title-row"><div><p className="eyebrow">EVIDENCE-BASED NEXT STEPS</p><h3>Recommendations</h3></div><ArrowUpRight size={18} className="title-muted" /></div>
-                {run.recommendations.length === 0 ? <EmptyNotice title="No recommendations" detail="There are no recommendations supported by this run's retrieved evidence." /> : <div className="recommendation-list">{run.recommendations.map((item, index) => <article className="recommendation-item" key={`${index}-${item.statement}`}><span className="recommendation-check"><Check size={15} /></span><div><p>{item.statement}</p><small>Evidence: {item.evidenceRefs.length ? item.evidenceRefs.join(", ") : "No evidence reference supplied"}</small></div></article>)}</div>}
+                {run.groundedAnswer?.recommendedNextStep && <article className="recommendation-item"><span className="recommendation-check"><Check size={15} /></span><div><p>{run.groundedAnswer.recommendedNextStep.text}</p><small>Evidence: {run.groundedAnswer.recommendedNextStep.evidenceRefs.join(", ")}</small></div></article>}
+                {run.recommendations.length === 0 && !run.groundedAnswer?.recommendedNextStep ? <EmptyNotice title="No recommendations" detail="There are no recommendations supported by this run's retrieved evidence." /> : <div className="recommendation-list">{run.recommendations.map((item, index) => <article className="recommendation-item" key={`${index}-${item.statement}`}><span className="recommendation-check"><Check size={15} /></span><div><p>{item.statement}</p><small>{item.reason}</small><small>Evidence: {item.evidenceRefs.length ? item.evidenceRefs.join(", ") : "No evidence reference supplied"}</small><small>Expected outcome: {item.expectedOutcome}</small></div></article>)}</div>}
               </section>
 
               <section className="panel">
@@ -527,6 +564,9 @@ export default function App() {
               {run.trace.status === "FAILED" && <div className="tool-error-summary"><AlertCircle size={15} /><span>Run or tool failure recorded. Review event details below.</span></div>}
               {events.length === 0 ? <EmptyNotice title="No activity recorded" detail="No trace events are available for this run yet." /> : <ol className="activity-list">{events.map((event, index) => <li className="activity-event" key={event.eventId}><span className={`event-marker ${event.eventType.includes("FAILED") ? "event-failed" : event.resultStatus === "SUCCESS" ? "event-success" : ""}`} />{index < events.length - 1 && <span className="event-rail" />}<div className="event-content"><div className="event-title-row"><strong>{eventLabel(event)}</strong><StatusPill status={event.resultStatus ?? event.eventType} /></div><span className="event-kind">{formatStatus(event.eventType)}</span>{eventDetail(event) && <p className={event.eventType.includes("FAILED") ? "event-error-text" : ""}>{eventDetail(event)}</p>}{event.durationMs !== undefined && <span className="event-duration"><Clock3 size={12} />{event.durationMs} ms</span>}<time>{new Date(event.timestamp).toLocaleString()}</time></div></li>)}</ol>}
               <div className="activity-footer"><span><span className={`trace-dot ${run.trace.status === "COMPLETED" ? "done" : run.trace.status === "FAILED" ? "failed" : ""}`} /> Trace {formatStatus(run.trace.status)}</span><span>{toolEvents.length} tool {toolEvents.length === 1 ? "call" : "calls"}</span></div>
+              <div className="subsection"><h4>Investigation plan</h4>
+                {!run.plan?.steps.length ? <EmptyNotice title="No tool steps selected" detail="The goal did not map to a configured business tool." /> : <ol className="agent-plan-list">{run.plan.steps.map((step, index) => <li className="agent-plan-step" key={`${step.tool}.${step.action}.${index}`}><span className="plan-sequence">{index + 1}</span><div><div className="plan-title"><strong>{step.tool} · {step.action}</strong>{step.dependsOnCRMResults && <span className="dependency-tag">After CRM matches</span>}</div><p>{step.purpose}</p></div></li>)}</ol>}
+              </div>
             </aside>
           </div>
         </>}

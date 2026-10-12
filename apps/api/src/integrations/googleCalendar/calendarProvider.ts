@@ -18,7 +18,7 @@ export type CalendarEventInput = { title: string; attendees: string[]; startTime
 export interface CalendarProvider {
   listUpcomingEvents(identity: CalendarIdentity, query: CalendarListQuery): Promise<CalendarEvent[]>;
   listBusyPeriods(identity: CalendarIdentity, query: CalendarListQuery): Promise<CalendarBusyPeriod[]>;
-  findEventsForLead(identity: CalendarIdentity, leadEmail: string): Promise<CalendarEvent[]>;
+  findEventsForLead(identity: CalendarIdentity, leadEmail: string, query?: CalendarListQuery): Promise<CalendarEvent[]>;
   getEventDetails(identity: CalendarIdentity, eventId: string): Promise<CalendarEvent | undefined>;
   connectionStatus(identity: CalendarIdentity): Promise<{ connected: boolean; reauthorizationRequired?: boolean; accessDenied?: boolean; unavailable?: boolean }>;
   createEvent(identity: CalendarIdentity, event: CalendarEventInput, actionId: string): Promise<CalendarEvent>;
@@ -40,9 +40,15 @@ export class MockCalendarProvider implements CalendarProvider {
     return (this.events.get(key(identity)) ?? []).filter((event) => event.status === "SCHEDULED" && Date.parse(event.startTime) >= start && Date.parse(event.startTime) < end)
       .sort((a, b) => Date.parse(a.startTime) - Date.parse(b.startTime)).map(cloneEvent);
   }
-  async findEventsForLead(identity: CalendarIdentity, leadEmail: string): Promise<CalendarEvent[]> {
+  async findEventsForLead(identity: CalendarIdentity, leadEmail: string, query: CalendarListQuery = {}): Promise<CalendarEvent[]> {
     const needle = leadEmail.toLocaleLowerCase("en-US");
-    return (this.events.get(key(identity)) ?? []).filter((event) => event.attendees.some((email) => email.toLocaleLowerCase("en-US") === needle)).map(cloneEvent);
+    const from = query.from ? Date.parse(query.from) : Date.now();
+    const until = query.until ? Date.parse(query.until) : from + 31 * 24 * 60 * 60 * 1000;
+    return (this.events.get(key(identity)) ?? [])
+      .filter((event) => event.status === "SCHEDULED" && Date.parse(event.startTime) >= from && Date.parse(event.startTime) < until &&
+        event.attendees.some((email) => email.toLocaleLowerCase("en-US") === needle))
+      .sort((left, right) => Date.parse(left.startTime) - Date.parse(right.startTime) || left.id.localeCompare(right.id, "en-US"))
+      .slice(0, 100).map(cloneEvent);
   }
   async listBusyPeriods(identity: CalendarIdentity, query: CalendarListQuery): Promise<CalendarBusyPeriod[]> {
     return (await this.listUpcomingEvents(identity, query)).map(({ startTime, endTime }) => ({ startTime, endTime }));
@@ -122,10 +128,20 @@ export class GoogleCalendarProvider implements CalendarProvider {
     });
   }
 
-  async findEventsForLead(identity: CalendarIdentity, leadEmail: string): Promise<CalendarEvent[]> {
-    const events = await this.listEvents(identity, { q: leadEmail, showDeleted: "false", maxResults: "250" });
+  async findEventsForLead(identity: CalendarIdentity, leadEmail: string, query: CalendarListQuery = {}): Promise<CalendarEvent[]> {
+    const from = query.from ?? new Date().toISOString();
+    const until = query.until ?? new Date(Date.parse(from) + 31 * 24 * 60 * 60 * 1000).toISOString();
+    const events = await this.listEvents(identity, {
+      q: leadEmail, timeMin: from, timeMax: until,
+      showDeleted: "false", singleEvents: "true", orderBy: "startTime", maxResults: "100"
+    });
     const email = leadEmail.toLocaleLowerCase("en-US");
-    return events.map(mapEvent).filter((event): event is CalendarEvent => event !== undefined && event.attendees.some((attendee) => attendee.toLocaleLowerCase("en-US") === email));
+    return events.map(mapEvent)
+      .filter((event): event is CalendarEvent => event !== undefined && event.status === "SCHEDULED" &&
+        Date.parse(event.startTime) >= Date.parse(from) && Date.parse(event.startTime) < Date.parse(until) &&
+        event.attendees.some((attendee) => attendee.toLocaleLowerCase("en-US") === email))
+      .sort((left, right) => Date.parse(left.startTime) - Date.parse(right.startTime) || left.id.localeCompare(right.id, "en-US"))
+      .slice(0, 100);
   }
 
   async getEventDetails(identity: CalendarIdentity, eventId: string): Promise<CalendarEvent | undefined> {
@@ -185,7 +201,8 @@ export class GoogleCalendarProvider implements CalendarProvider {
     const token = await this.accessToken(identity);
     const all: GoogleEventResource[] = [];
     let pageToken: string | undefined;
-    for (let page = 0; page < 10; page += 1) {
+    const pageLimit = params.maxResults === "100" ? 2 : 10;
+    for (let page = 0; page < pageLimit; page += 1) {
       const query = new URLSearchParams({ ...params, ...(pageToken ? { pageToken } : {}) });
       const response = await this.request(`https://www.googleapis.com/calendar/v3/calendars/primary/events?${query.toString()}`, {
         headers: { Authorization: `Bearer ${token}` }
@@ -196,7 +213,7 @@ export class GoogleCalendarProvider implements CalendarProvider {
       pageToken = result.nextPageToken;
       if (!pageToken) break;
     }
-    if (pageToken) throw new CalendarProviderError("CALENDAR_RESULT_LIMIT", "Calendar returned more than 2,500 matching events; narrow the requested time range.", 413);
+    if (pageToken) throw new CalendarProviderError("CALENDAR_RESULT_LIMIT", "Calendar returned more than the bounded event result limit; narrow the requested time range.", 413);
     await this.markHealth(identity, "verified");
     return all;
   }

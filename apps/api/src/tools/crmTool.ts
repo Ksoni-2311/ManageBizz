@@ -1,6 +1,6 @@
 import { ToolExecutionContext, ToolResponse } from "@nexusops/shared-types";
 import { z } from "zod";
-import { CRMLead, DEFAULT_MIN_DEAL_VALUE, getActiveHighValueLeads, getInactiveHighValueLeads, validateCRMLeads } from "./crmDomain.js";
+import { CRMLead, DEFAULT_MIN_DEAL_VALUE, getActiveHighValueLeads, getInactiveHighValueLeads, resolveCRMContact, validateCRMLeads } from "./crmDomain.js";
 import { emailAddress, nonEmpty, nonNegativeNumber, runValidated, ToolDomainError } from "./contract.js";
 import { CRMRepository, crmRepository } from "./crmRepository.js";
 
@@ -8,7 +8,8 @@ export type CRMToolOptions = { clock?: () => Date; repository?: CRMRepository };
 const cloneLead = (lead: CRMLead): CRMLead => ({ ...lead, lastContactedAt: new Date(lead.lastContactedAt), notes: [...lead.notes] });
 const activeSchema = z.object({ minDealValue: nonNegativeNumber }).strict();
 const inactiveSchema = z.object({ minDaysInactive: nonNegativeNumber.default(30), minDealValue: nonNegativeNumber.default(DEFAULT_MIN_DEAL_VALUE) }).strict();
-const searchSchema = z.object({ query: z.string().trim().optional(), status: z.string().trim().min(1).optional(), minDealValue: nonNegativeNumber.optional() }).strict();
+const searchSchema = z.object({ query: z.string().trim().max(200).optional(), status: z.string().trim().min(1).optional(), minDealValue: nonNegativeNumber.optional(), limit: z.number().int().min(1).max(100).default(100) }).strict();
+const resolveSchema = z.object({ query: z.string().trim().min(1).max(200), company: z.string().trim().min(1).max(200).optional() }).strict();
 const updateSchema = z.object({ leadId: nonEmpty, status: nonEmpty.optional(), dealValue: nonNegativeNumber.optional() }).strict();
 const noteSchema = z.object({ leadId: nonEmpty, note: nonEmpty }).strict();
 
@@ -22,9 +23,9 @@ export class CRMToolService {
     this.repository = options.repository ?? crmRepository;
   }
 
-  setLeads(rows: readonly Record<string, unknown>[], workspaceId: string): void {
-    if (!workspaceId.trim()) throw new Error("A workspace is required to seed development CRM data.");
-    this.fallbackByWorkspace.set(workspaceId, validateCRMLeads(rows));
+  setLeads(rows: readonly Record<string, unknown>[], workspaceId: string, ownerUserId: string): void {
+    if (!workspaceId.trim() || !ownerUserId.trim()) throw new Error("A workspace and owner are required to seed development CRM data.");
+    this.fallbackByWorkspace.set(fallbackKey(workspaceId, ownerUserId), validateCRMLeads(rows));
   }
 
   listActiveHighValueLeads(params: unknown, context: ToolExecutionContext): Promise<ToolResponse<CRMLead[]>> {
@@ -37,14 +38,30 @@ export class CRMToolService {
   }
 
   searchLeads(params: unknown, context: ToolExecutionContext): Promise<ToolResponse<CRMLead[]>> {
-    return runValidated(searchSchema, params, context, async ({ query, status, minDealValue }) => {
+    return runValidated(searchSchema, params, context, async ({ query, status, minDealValue, limit }) => {
       const needle = (query ?? "").toLocaleLowerCase("en-US");
-      return (await this.leadsFor(context)).filter((lead) =>
+      const matches = (await this.leadsFor(context)).filter((lead) =>
         (!status || lead.status?.toLocaleLowerCase("en-US") === status.toLocaleLowerCase("en-US")) &&
         (minDealValue === undefined || lead.dealValue >= minDealValue) &&
         (!needle || [lead.name, lead.company, lead.email].some((value) => value.toLocaleLowerCase("en-US").includes(needle)))
-      ).map(cloneLead);
+      );
+      const score = (lead: CRMLead): number => {
+        if (!needle) return 0;
+        if (lead.email.toLocaleLowerCase("en-US") === needle) return 5;
+        if (lead.name.toLocaleLowerCase("en-US") === needle) return 4;
+        if (lead.company.toLocaleLowerCase("en-US") === needle) return 3;
+        if (lead.name.toLocaleLowerCase("en-US").startsWith(needle)) return 2;
+        return 1;
+      };
+      return matches.sort((left, right) => !needle ? 0 : score(right) - score(left) ||
+        left.name.localeCompare(right.name, "en-US") || left.id.localeCompare(right.id, "en-US"))
+        .slice(0, limit).map(cloneLead);
     });
+  }
+
+  resolveContact(params: unknown, context: ToolExecutionContext): Promise<ToolResponse<ReturnType<typeof resolveCRMContact>>> {
+    return runValidated(resolveSchema, params, context, async ({ query, company }) =>
+      resolveCRMContact(await this.leadsFor(context), { query, ...(company ? { company } : {}) }));
   }
 
   updateLead(params: unknown, context: ToolExecutionContext): Promise<ToolResponse<{ lead: CRMLead; updated: true }>> {
@@ -72,14 +89,18 @@ export class CRMToolService {
   private async leadsFor(context: ToolExecutionContext): Promise<CRMLead[]> {
     const stored = await this.repository.get(context.orgId, context.userId);
     if (stored) return stored.leads;
-    return (this.fallbackByWorkspace.get(context.orgId) ?? []).map(cloneLead);
+    return (this.fallbackByWorkspace.get(fallbackKey(context.orgId, context.userId)) ?? []).map(cloneLead);
   }
 
   private async saveLeads(workspaceId: string, ownerUserId: string, leads: CRMLead[]): Promise<void> {
     const stored = await this.repository.get(workspaceId, ownerUserId);
     if (stored) await this.repository.save(workspaceId, { ...stored, leads });
-    else this.fallbackByWorkspace.set(workspaceId, leads.map(cloneLead));
+    else this.fallbackByWorkspace.set(fallbackKey(workspaceId, ownerUserId), leads.map(cloneLead));
   }
 }
 
 export const CRMTool = new CRMToolService();
+
+function fallbackKey(workspaceId: string, ownerUserId: string): string {
+  return `${workspaceId}\0${ownerUserId}`;
+}

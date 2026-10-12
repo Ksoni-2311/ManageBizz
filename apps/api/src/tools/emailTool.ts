@@ -4,14 +4,14 @@ import { emailAddress, nonEmpty, requireApprovedAction, runValidated, ToolDomain
 import { EmailContent, EmailDraftInput, EmailIdentity, EmailProvider, EmailSearch, GmailProvider, MockEmailProvider, ProviderEmail, ProviderEmailDraft, ProviderSentEmail } from "../integrations/gmail/emailProvider.js";
 import { GoogleProviderError } from "../integrations/googleOAuth/googleProviderError.js";
 
-const historySchema = z.object({ leadEmail: emailAddress.optional(), leadEmails: z.array(emailAddress).max(500).optional(), query: z.string().trim().min(1).max(500).optional() }).strict()
+const historySchema = z.object({ leadEmail: emailAddress.optional(), leadEmails: z.array(emailAddress).max(50).optional(), query: z.string().trim().min(1).max(500).optional() }).strict()
   .refine(({ leadEmail, leadEmails }) => !(leadEmail && leadEmails), "Use leadEmail or leadEmails, not both")
   .refine(({ leadEmails }) => !leadEmails || new Set(leadEmails.map((email) => email.toLowerCase())).size === leadEmails.length, "leadEmails must be unique")
 const metadataSchema = z.object({ messageId: nonEmpty.max(500) }).strict();
 const contentSearchSchema = z.object({ leadEmail: emailAddress.optional(), query: z.string().trim().min(1).max(500), limit: z.number().int().min(1).max(5).default(5) }).strict();
 const emailSchema = z.object({ to: emailAddress, subject: nonEmpty.max(998).refine((value) => !/[\r\n]/.test(value), "Subject cannot contain line breaks."), body: nonEmpty.max(100_000) }).strict();
 const sendSchema = z.object({ draftId: nonEmpty.max(500) }).strict();
-const messageSchema = z.object({ id: nonEmpty, threadId: nonEmpty.optional(), leadEmail: emailAddress.optional(), direction: z.enum(["OUTBOUND", "INBOUND"]), subject: nonEmpty.optional(), sentAt: z.string().datetime().optional(), inReplyToMessageId: nonEmpty.optional(), messageId: nonEmpty.optional() }).strict();
+const messageSchema = z.object({ id: nonEmpty, threadId: nonEmpty.optional(), leadEmail: emailAddress.optional(), senderEmail: emailAddress.optional(), direction: z.enum(["OUTBOUND", "INBOUND"]), subject: nonEmpty.optional(), sentAt: z.string().datetime().optional(), inReplyToMessageId: nonEmpty.optional(), messageId: nonEmpty.optional() }).strict();
 const messagesSchema = z.array(messageSchema);
 type StoredMessage = z.infer<typeof messageSchema>;
 export type EmailHistoryMessage = StoredMessage & { responseStatus: "INBOUND" | "ANSWERED" | "UNANSWERED" };
@@ -22,7 +22,12 @@ const emptyContext: ToolExecutionContext = { goalId: "", runId: "", actionId: ""
 export class EmailService {
   constructor(private readonly provider: EmailProvider) {}
   async history(identity: EmailIdentity, query: EmailSearch): Promise<EmailHistoryMessage[]> {
-    const records = messagesSchema.parse(await this.provider.search(identity, query));
+    const searched = messagesSchema.parse(await this.provider.search(identity, query));
+    const targets = query.leadEmail ? new Set([query.leadEmail.toLocaleLowerCase("en-US")])
+      : query.leadEmails ? new Set(query.leadEmails.map((email) => email.toLocaleLowerCase("en-US"))) : undefined;
+    const records = targets
+      ? searched.filter((message) => message.leadEmail && targets.has(message.leadEmail.toLocaleLowerCase("en-US")))
+      : searched;
     assertUnique(records);
     return records.map((message) => ({ ...message, responseStatus: responseStatus(message, records) }));
   }
@@ -78,8 +83,12 @@ export class EmailToolService {
 }
 function responseStatus(message: StoredMessage, records: StoredMessage[]): EmailHistoryMessage["responseStatus"] {
   if (message.direction === "INBOUND") return "INBOUND";
-  const repliedByReference = records.some((candidate) => candidate.direction === "INBOUND" && candidate.inReplyToMessageId === message.id);
-  const repliedInThread = Boolean(message.threadId && message.sentAt && records.some((candidate) => candidate.direction === "INBOUND" && candidate.threadId === message.threadId && candidate.sentAt && candidate.sentAt > message.sentAt!));
+  const contact = message.leadEmail?.toLocaleLowerCase("en-US");
+  const repliedByReference = records.some((candidate) => candidate.direction === "INBOUND" &&
+    candidate.leadEmail?.toLocaleLowerCase("en-US") === contact && candidate.inReplyToMessageId === message.id);
+  const repliedInThread = Boolean(message.threadId && message.sentAt && records.some((candidate) =>
+    candidate.direction === "INBOUND" && candidate.leadEmail?.toLocaleLowerCase("en-US") === contact &&
+    candidate.threadId === message.threadId && candidate.sentAt && candidate.sentAt > message.sentAt!));
   return repliedByReference || repliedInThread ? "ANSWERED" : "UNANSWERED";
 }
 function assertUnique(messages: readonly StoredMessage[]) { const ids = new Set<string>(); for (const message of messages) { if (ids.has(message.id)) throw new ToolDomainError("INVALID_DATA", `Duplicate email message identity: ${message.id}`); ids.add(message.id); } }

@@ -62,7 +62,8 @@ describe("email, calendar, and analytics system contracts", () => {
     assert.equal(missing.success, false);
     if (!missing.success) assert.equal(missing.error.code, "NOT_FOUND");
     const relevant = await calendar.findEventsForLead({ leadEmail: "attendee@example.invalid" }, context);
-    assert.equal(relevant.success && relevant.data.length, 3);
+    assert.equal(relevant.success && relevant.data.length, 2);
+    if (relevant.success) assert.ok(relevant.data.every(({ startTime }) => Date.parse(startTime) >= fixedNow.getTime()));
     const plan = planBusinessGoal({ objective: "Show upcoming calendar events", timeWindowDays: 30, constraints: [], successCriteria: [] });
     assert.equal(plan.initialCalls[0]?.action, "listUpcomingEvents");
   });

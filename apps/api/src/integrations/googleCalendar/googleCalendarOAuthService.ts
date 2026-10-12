@@ -62,7 +62,7 @@ export class GoogleCalendarOAuthService {
       : existing?.encryptedRefreshToken;
     if (!encryptedRefreshToken) throw new GoogleCalendarOAuthError("OAUTH_TOKEN_EXCHANGE_FAILED", "Google did not provide a refresh token. Retry connecting and approve offline access.", 502);
     try {
-      const verification = await this.request("https://www.googleapis.com/calendar/v3/calendars/primary", {
+      const verification = await this.request("https://www.googleapis.com/calendar/v3/calendars/primary/events?maxResults=1&showDeleted=false", {
         headers: { Authorization: `Bearer ${tokens.access_token}` }
       });
       if (!verification.ok) {

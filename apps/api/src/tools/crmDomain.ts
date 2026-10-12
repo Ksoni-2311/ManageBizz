@@ -25,6 +25,213 @@ export type CRMLeadInput = Omit<CRMLead, "lastContactedAt"> & {
   lastContactedAt: Date | string | number;
 };
 
+export type CRMContactMatchMethod =
+  | "exact_email"
+  | "normalized_email"
+  | "exact_phone"
+  | "exact_name"
+  | "exact_person_company"
+  | "exact_company"
+  | "email_domain"
+  | "name_component"
+  | "fuzzy_name"
+  | "fuzzy_company";
+
+export type CRMContactResolution =
+  | {
+    status: "RESOLVED";
+    entity: {
+      entityType: "person" | "company";
+      crmRecordRef: string;
+      canonicalName: string;
+      company: string;
+      email: string;
+      confidence: number;
+      matchedBy: CRMContactMatchMethod;
+    };
+  }
+  | {
+    status: "AMBIGUOUS";
+    candidates: Array<{
+      crmRecordRef: string;
+      canonicalName: string;
+      company: string;
+      matchedBy: CRMContactMatchMethod;
+      confidence: number;
+    }>;
+  }
+  | { status: "NOT_FOUND"; query: string };
+
+export function normalizeCRMEmail(value: string): string {
+  return value.trim().normalize("NFKC").toLocaleLowerCase("en-US");
+}
+
+function normalizeCRMPhone(value: string): string {
+  return value.replace(/\D/g, "");
+}
+
+function normalizeCRMName(value: string): string {
+  return value.trim().normalize("NFKC").toLocaleLowerCase("en-US").replace(/\s+/g, " ");
+}
+
+function normalizeCRMCompany(value: string): string {
+  return normalizeCRMName(value)
+    .replace(/[.,'’]/g, " ")
+    .replace(/[^\p{L}\p{N}]+/gu, " ")
+    .replace(/\s+/g, " ")
+    .replace(/\s+(incorporated|corporation|corp|company|co|limited|ltd|llc|plc|gmbh)$/g, "")
+    .trim();
+}
+
+function editSimilarity(left: string, right: string): number {
+  const previous = Array.from({ length: right.length + 1 }, (_, index) => index);
+  for (let row = 1; row <= left.length; row += 1) {
+    let diagonal = previous[0]!;
+    previous[0] = row;
+    for (let column = 1; column <= right.length; column += 1) {
+      const above = previous[column]!;
+      previous[column] = Math.min(previous[column]! + 1, previous[column - 1]! + 1, diagonal + (left[row - 1] === right[column - 1] ? 0 : 1));
+      diagonal = above;
+    }
+  }
+  return 1 - previous[right.length]! / Math.max(left.length, right.length, 1);
+}
+
+/** Exact identity is preferred; weak/approximate candidates are always returned for clarification. */
+export function resolveCRMContact(
+  leads: readonly CRMLead[],
+  input: { query: string; company?: string }
+): CRMContactResolution {
+  const query = input.query.trim();
+  const normalizedQuery = normalizeCRMName(query);
+  const normalizedCompany = input.company ? normalizeCRMCompany(input.company) : undefined;
+  const email = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(query) ? normalizeCRMEmail(query) : undefined;
+  const candidates: Array<{ lead: CRMLead; matchedBy: CRMContactMatchMethod; confidence: number }> = [];
+
+  const collect = (
+    matches: CRMLead[],
+    matchedBy: CRMContactMatchMethod,
+    confidence: number,
+    entityType: "person" | "company"
+  ): CRMContactResolution | undefined => {
+    if (!matches.length) return undefined;
+    const unique = [...new Map(matches.map((lead) => [lead.id, lead])).values()];
+    if (unique.length > 1) {
+      return {
+        status: "AMBIGUOUS",
+        candidates: unique.sort((left, right) => left.name.localeCompare(right.name, "en-US") || left.id.localeCompare(right.id, "en-US")).slice(0, 10).map((lead) => ({
+          crmRecordRef: lead.id, canonicalName: lead.name, company: lead.company, matchedBy, confidence
+        }))
+      };
+    }
+    const lead = unique[0]!;
+    return {
+      status: "RESOLVED",
+      entity: {
+        entityType, crmRecordRef: lead.id, canonicalName: lead.name, company: lead.company,
+        email: normalizeCRMEmail(lead.email), confidence, matchedBy
+      }
+    };
+  };
+
+  if (email) {
+    const exact = leads.filter((lead) => lead.email === email);
+    const match = collect(exact, "exact_email", 1, "person");
+    if (match) return match;
+    // Normalized matching remains explicit even though validated CRM rows are canonicalized at ingestion.
+    const normalized = leads.filter((lead) => normalizeCRMEmail(lead.email) === email);
+    const normalizedMatch = collect(normalized, "normalized_email", 0.99, "person");
+    if (normalizedMatch) return normalizedMatch;
+    const domain = email.slice(email.lastIndexOf("@") + 1);
+    const domainCandidates = leads.filter((lead) => lead.email.split("@")[1]?.toLocaleLowerCase("en-US") === domain);
+    if (domainCandidates.length) {
+      return {
+        status: "AMBIGUOUS",
+        candidates: domainCandidates
+          .sort((left, right) => left.name.localeCompare(right.name, "en-US") || left.id.localeCompare(right.id, "en-US"))
+          .slice(0, 10)
+          .map((lead) => ({
+            crmRecordRef: lead.id, canonicalName: lead.name, company: lead.company,
+            matchedBy: "email_domain", confidence: 0.7
+          }))
+      };
+    }
+    return { status: "NOT_FOUND", query };
+  }
+
+  const phoneDigits = normalizeCRMPhone(query);
+  if (phoneDigits.length >= 7 && !/[a-z]/i.test(query)) {
+    const phoneMatches = leads.filter((lead) => lead.phone && normalizeCRMPhone(lead.phone) === phoneDigits);
+    return collect(phoneMatches, "exact_phone", 0.99, "person") ?? { status: "NOT_FOUND", query };
+  }
+
+  if (!normalizedQuery) return { status: "NOT_FOUND", query };
+  if (normalizedCompany) {
+    const personAndCompany = leads.filter((lead) =>
+      normalizeCRMName(lead.name) === normalizedQuery && normalizeCRMCompany(lead.company) === normalizedCompany);
+    const match = collect(personAndCompany, "exact_person_company", 0.98, "person");
+    if (match) return match;
+  }
+
+  const exactNames = leads.filter((lead) => normalizeCRMName(lead.name) === normalizedQuery &&
+    (!normalizedCompany || normalizeCRMCompany(lead.company) === normalizedCompany));
+  const exactNameMatch = collect(exactNames, normalizedCompany ? "exact_person_company" : "exact_name", normalizedCompany ? 0.98 : 0.97, "person");
+  if (exactNameMatch) return exactNameMatch;
+
+  if (normalizedCompany && /\S+/.test(normalizedQuery)) {
+    const sameFirstNameAndCompany = leads.filter((lead) =>
+      normalizeCRMName(lead.name).split(" ")[0] === normalizedQuery &&
+      normalizeCRMCompany(lead.company) === normalizedCompany);
+    const partialNameMatch = collect(sameFirstNameAndCompany, "name_component", 0.86, "person");
+    if (partialNameMatch) return partialNameMatch;
+  }
+
+  const exactCompanies = leads.filter((lead) =>
+    normalizeCRMCompany(lead.company) === normalizeCRMCompany(query) &&
+    (!normalizedCompany || normalizeCRMCompany(lead.company) === normalizedCompany));
+  const companyMatch = collect(exactCompanies, "exact_company", 0.96, "company");
+  if (companyMatch) return companyMatch;
+
+  if (query.includes("@")) {
+    const domain = query.slice(query.lastIndexOf("@") + 1).toLocaleLowerCase("en-US");
+    const domainMatches = leads.filter((lead) => lead.email.split("@")[1]?.toLocaleLowerCase("en-US") === domain);
+    const domainMatch = collect(domainMatches, "email_domain", 0.8, "company");
+    if (domainMatch) return domainMatch;
+  }
+
+  const queryTokens = normalizedQuery.split(" ").filter(Boolean);
+  const exactComponentMatches = leads.filter((lead) => {
+    const nameTokens = normalizeCRMName(lead.name).split(" ");
+    return queryTokens.length === 1 && nameTokens.includes(queryTokens[0]!) &&
+      (!normalizedCompany || normalizeCRMCompany(lead.company) === normalizedCompany);
+  });
+  if (exactComponentMatches.length) {
+    const match = collect(exactComponentMatches, "name_component", exactComponentMatches.length > 1 ? 0.72 : 0.88, "person");
+    if (match) return match;
+  }
+
+  for (const lead of leads) {
+    const nameScore = editSimilarity(normalizedQuery, normalizeCRMName(lead.name));
+    const companyScore = editSimilarity(normalizeCRMCompany(query), normalizeCRMCompany(lead.company));
+    if (normalizedCompany && normalizeCRMCompany(lead.company) !== normalizedCompany) continue;
+    if (nameScore >= 0.82) candidates.push({ lead, matchedBy: "fuzzy_name", confidence: Number(nameScore.toFixed(2)) });
+    else if (companyScore >= 0.82) candidates.push({ lead, matchedBy: "fuzzy_company", confidence: Number(companyScore.toFixed(2)) });
+  }
+  if (candidates.length) {
+    return {
+      status: "AMBIGUOUS",
+      candidates: candidates
+        .sort((left, right) => right.confidence - left.confidence || left.lead.name.localeCompare(right.lead.name, "en-US") || left.lead.id.localeCompare(right.lead.id, "en-US"))
+        .slice(0, 10)
+        .map(({ lead, matchedBy, confidence }) => ({
+          crmRecordRef: lead.id, canonicalName: lead.name, company: lead.company, matchedBy, confidence
+        }))
+    };
+  }
+
+  return { status: "NOT_FOUND", query };
+}
+
 /** Excel's 1900 date system uses 1899-12-30 as its serial-date epoch. */
 export function normalizeCRMDate(value: Date | string | number, field = "lastContactedAt"): Date {
   let date: Date;
