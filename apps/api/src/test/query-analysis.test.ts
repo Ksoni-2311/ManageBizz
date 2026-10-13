@@ -33,6 +33,7 @@ describe("structured business query analysis", () => {
     const highValue = deterministicQueryAnalysis("Which high-value leads have no recent email interaction?");
     assert.equal(highValue.intent, "crm_lead_search");
     assert.deepEqual(highValue.sources, ["crm", "gmail"]);
+    assert.deepEqual(highValue.entities, []);
     assert.ok(highValue.filters.some(({ field }) => field === "highValue"));
   });
 
@@ -132,6 +133,36 @@ describe("structured business query analysis", () => {
     assert.equal(plan.intent, "cross_source_contact_status");
     assert.deepEqual(plan.entities, [{ type: "company", value: "Acme" }, { type: "person", value: "Rahul" }]);
     assert.deepEqual(plan.sources, ["crm", "gmail"]);
+  });
+
+  it("classifies broad named-contact relationship questions without inventing filters or dates", () => {
+    const prompts = [
+      "What is the current status of my relationship with Keshav?",
+      "Summarize the interactions I have had with Keshav.",
+      "Give me an overview of Keshav's business engagement."
+    ];
+    for (const prompt of prompts) {
+      const analysis = deterministicQueryAnalysis(prompt);
+      assert.equal(analysis.intent, "cross_source_contact_status", prompt);
+      assert.deepEqual(analysis.entities, [{ type: "person", value: "Keshav" }], prompt);
+      assert.deepEqual(analysis.sources, ["crm", "gmail", "calendar"], prompt);
+      assert.equal(analysis.dateRange, undefined, prompt);
+      assert.deepEqual(analysis.filters, [], prompt);
+      assert.deepEqual(analysis.dependencies, [
+        { source: "gmail", dependsOn: "crm" },
+        { source: "calendar", dependsOn: "crm" }
+      ], prompt);
+    }
+
+    const objective = prompts[0]!;
+    const investigation = planBusinessGoal(parsed(objective), deterministicQueryAnalysis(objective), "Asia/Kolkata");
+    assert.deepEqual(investigation.initialCalls.map(({ tool, action }) => `${tool}.${action}`), ["crm.resolveContact"]);
+    assert.deepEqual(investigation.dependentCalls?.map(({ tool, action }) => `${tool}.${action}`), [
+      "email.getEmailHistory",
+      "calendar.findEventsForLead"
+    ]);
+    assert.equal(investigation.dependentCalls?.[0]?.params.leadEmail, undefined);
+    assert.equal(investigation.dependentCalls?.[1]?.params.until, undefined);
   });
 
   it("resolves a named Calendar attendee through CRM before searching Calendar", () => {

@@ -80,7 +80,7 @@ describe("generic grounded evidence", () => {
     const answer = validateGroundedAnswer(answerCandidate(report.bundle, [
       { text: crm.statement, evidenceRefs: [crm.evidenceRef] },
       { text: "A reply was received from the exact CRM-resolved contact.", evidenceRefs: [gmail.evidenceRef] },
-      { text: "Event matched the exact CRM-resolved attendee email within the requested date range at 2026-10-05T10:00:00.000Z.", evidenceRefs: [calendar.evidenceRef] },
+      { text: "Event matched the exact CRM-resolved attendee email within the bounded search window at 2026-10-05T10:00:00.000Z.", evidenceRefs: [calendar.evidenceRef] },
       { text: "Rahul Sharma at Acme had a reply and an event at 2026-10-05T10:00:00.000Z.", evidenceRefs: [crm.evidenceRef, gmail.evidenceRef, calendar.evidenceRef] }
     ]), report.bundle, report.FACT);
     assert.equal(answer.claims.length, 4);
@@ -105,6 +105,13 @@ describe("generic grounded evidence", () => {
     assert.match(partial.FACT[1]!.statement, /No matching Gmail messages/);
     assert.doesNotMatch(partial.FACT[1]!.statement, /never replied|did not reply/i);
     assert.equal(partial.bundle.sourceCoverage.find(({ source }) => source === "calendar")?.retrievalStatus, "NOT_ATTEMPTED");
+
+    const calendarNoMatch = buildEvidenceReport([
+      crossSourceObservations()[0]!,
+      { tool: "calendar", action: "findEventsForLead", params: { leadEmail: "private" }, result: { success: true, data: [] } }
+    ], ["crm", "calendar"]);
+    assert.match(calendarNoMatch.FACT[1]!.statement, /bounded search window/i);
+    assert.doesNotMatch(calendarNoMatch.FACT[1]!.statement, /requested date range/i);
   });
 
   it("links dependent Gmail and Calendar results to one exact CRM candidate email", () => {

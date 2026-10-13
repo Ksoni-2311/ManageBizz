@@ -25,6 +25,8 @@ function StatusPill({ status }: { status: string }) {
     ? "pill-success"
     : status === "failed" || status === "FAILED" || status === "REJECTED" || status === "VERIFICATION_FAILED"
       ? "pill-danger"
+      : status === "EXPIRED"
+        ? "pill-danger"
       : status === "awaiting_approval" || status === "PROPOSED" || status === "PENDING"
         ? "pill-waiting"
         : "pill-neutral";
@@ -75,23 +77,36 @@ function ActionCard({
     <article className="action-card">
       <div className="action-card-heading">
         <div>
-          <p className="eyebrow">{action.tool} · {action.action}</p>
-          <h3>{action.action === "createTask" && typeof action.params.title === "string" ? action.params.title : "Proposed action"}</h3>
+          <p className="eyebrow">{action.actionType || `${action.tool}.${action.action}`}</p>
+          <h3>{action.action === "createTask" && typeof action.params.title === "string" ? action.params.title : action.target?.description ?? "Proposed action"}</h3>
         </div>
         <StatusPill status={action.lifecycle} />
       </div>
       <StatusPill status={`RISK_${action.riskLevel ?? "UNKNOWN"}`} />
+      <div className="action-context">
+        {action.target && <p><strong>Target:</strong> {action.target.description}</p>}
+        <p><strong>Why:</strong> {action.rationale}</p>
+        <p><strong>Expected outcome:</strong> {action.expectedOutcome}</p>
+        <p><strong>Required permissions:</strong> {action.requiredPermissions.join(", ") || "None listed"}</p>
+        <p><strong>Evidence:</strong> {action.evidenceRefs.length ? action.evidenceRefs.join(", ") : "No prior evidence required"}</p>
+        <p><strong>Expires:</strong> {formatDateTime(action.expiresAt)}</p>
+      </div>
       {action.action === "createTask" && typeof action.params.title === "string" && <p className="muted">Task title: {action.params.title}</p>}
       {action.action === "draftEmail" && <div className="action-preview"><strong>To:</strong> {String(action.params.to ?? "Unavailable")}<br /><strong>Subject:</strong> {String(action.params.subject ?? "Unavailable")}<pre>{String(action.params.body ?? "No draft body supplied.")}</pre></div>}
       {action.action === "sendEmail" && <div className="action-preview"><strong>Draft to send:</strong> {relatedDraft?.to ?? "Recipient unavailable"}<br /><strong>Subject:</strong> {relatedDraft?.subject ?? "Subject unavailable"}<p>{relatedDraft?.body ?? `Draft ID: ${String(action.params.draftId ?? "Unavailable")}`}</p><small>Gmail will send this existing draft only after approval.</small></div>}
       {action.action === "createMeeting" && <div className="action-preview"><strong>Event:</strong> {String(action.params.title ?? "Unavailable")}<br /><strong>Start:</strong> {String(action.params.startTime ?? "Unavailable")}<br /><strong>End:</strong> {String(action.params.endTime ?? "Unavailable")}<br /><strong>Attendees:</strong> {Array.isArray(action.params.attendees) && action.params.attendees.length ? action.params.attendees.join(", ") : "None"}</div>}
+      {action.action === "updateLead" && <div className="action-preview"><strong>CRM changes:</strong>{typeof action.params.status === "string" && <p>Status: {action.params.status}</p>}{typeof action.params.dealValue === "number" && <p>Deal value: {action.params.dealValue}</p>}</div>}
+      {action.action === "addLeadNote" && <div className="action-preview"><strong>Note to add:</strong><pre>{String(action.params.note ?? "Unavailable")}</pre></div>}
       {task?.id && <p className="muted">Task ID: <code>{task.id}</code>{task.status ? ` · ${task.status}` : ""}</p>}
+      {action.action === "updateLead" && action.result?.success && <p className="muted">CRM update verified.</p>}
+      {action.action === "addLeadNote" && action.result?.success && <p className="muted">CRM note addition verified.</p>}
       {action.result && !action.result.success && <div className="inline-error"><AlertCircle size={15} />{action.result.error?.message ?? "Action failed."}</div>}
       {pending && <div className="button-row action-buttons">
         <button className="button button-secondary" disabled={busy} onClick={() => onDecision(action, "REJECT")}><X size={16} /> Reject</button>
-        <button className="button button-primary" disabled={busy} onClick={() => onDecision(action, "APPROVE")}><Check size={16} /> Approve &amp; execute</button>
+        <button className="button button-primary" disabled={busy || Date.now() >= Date.parse(action.expiresAt)} onClick={() => onDecision(action, "APPROVE")}><Check size={16} /> Approve &amp; execute</button>
       </div>}
       {action.lifecycle === "PROPOSED" && <p className="hint">No mutation will run until you approve this proposal.</p>}
+      {action.lifecycle === "EXPIRED" && <p className="hint">This preview expired; submit the action again for a fresh review.</p>}
     </article>
   );
 }

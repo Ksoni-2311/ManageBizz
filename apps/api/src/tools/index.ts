@@ -29,6 +29,7 @@ export const READ_ONLY_TOOL_ACTIONS: Readonly<Record<string, readonly string[]>>
 };
 
 export const ACTION_TOOL_ACTIONS: Readonly<Record<string, readonly string[]>> = {
+  crm: ["updateLead", "addLeadNote"],
   email: ["draftEmail", "sendEmail"],
   calendar: ["createMeeting"],
   tasks: ["createTask", "completeTask"]
@@ -181,9 +182,23 @@ function sameCall(a: ActionIdempotencyInput, b: ActionIdempotencyInput): boolean
 }
 function isDuplicateKey(error: unknown): boolean { return typeof error === "object" && error !== null && "code" in error && (error as { code?: unknown }).code === 11000; }
 function safeActionResult(tool: string, action: string, result: ToolResponse): ToolResponse {
-  if (tool !== "email" || action !== "draftEmail" || !result.success || typeof result.data !== "object" || result.data === null) return structuredClone(result);
-  const { draftId, to, subject, status } = result.data as Record<string, unknown>;
-  return { success: true, data: { draftId, to, subject, status } };
+  if (!result.success || typeof result.data !== "object" || result.data === null) return structuredClone(result);
+  const data = result.data as Record<string, unknown>;
+  if (tool === "email" && action === "draftEmail") {
+    const { draftId, to, subject, status } = data;
+    return { success: true, data: { draftId, to, subject, status } };
+  }
+  if (tool === "crm" && action === "updateLead" && data.updated === true && typeof data.lead === "object" && data.lead !== null) {
+    const lead = data.lead as Record<string, unknown>;
+    return {
+      success: true,
+      data: { updated: true, lead: { id: lead.id, status: lead.status, dealValue: lead.dealValue } }
+    };
+  }
+  if (tool === "crm" && action === "addLeadNote") {
+    return { success: true, data: { leadId: data.leadId, noteCount: data.noteCount } };
+  }
+  return structuredClone(result);
 }
 function withCacheMetadata(result: ToolResponse, actionId: string): ToolResponse {
   if (result.success) return { ...result, metadata: { executionTimeMs: 0, actionId, cached: true } };

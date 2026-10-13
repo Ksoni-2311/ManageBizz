@@ -8,6 +8,9 @@ export type PlannedToolCall = {
   action: string;
   params: Record<string, unknown>;
   purpose: string;
+  evidenceRefs?: string[];
+  target?: { description: string; identityRef?: string };
+  bindResolvedContact?: boolean;
 };
 
 export type InvestigationPlan = {
@@ -207,12 +210,33 @@ function requestedDirectAction(objective: string): PlannedToolCall | undefined {
   if (draft) return { tool: "email", action: "draftEmail", params: { to: draft[1], subject: draft[2], body: draft[3] }, purpose: "Create exactly the email draft explicitly supplied by the user; wait for approval and verify Gmail's returned draft." };
   const send = objective.match(/^\s*(?:please\s+)?send (?:the )?email draft\s+([A-Za-z0-9._:-]+)\s*$/i);
   if (send) return { tool: "email", action: "sendEmail", params: { draftId: send[1] }, purpose: "Send only the identified existing Gmail draft after approval, then verify the sent message." };
+  const crmStatus = objective.match(/^\s*(?:please\s+)?update CRM lead ([A-Za-z0-9._:-]+) status to ([A-Za-z][\w -]{0,39})\.?\s*$/i);
+  if (crmStatus) return {
+    tool: "crm", action: "updateLead", params: { leadId: crmStatus[1], status: crmStatus[2]!.trim() },
+    purpose: "Update only the status on the CRM lead ID and to the exact status explicitly supplied by the user."
+  };
+  const crmDealValue = objective.match(/^\s*(?:please\s+)?update CRM lead ([A-Za-z0-9._:-]+) deal value to \$?([\d,]+(?:\.\d{1,2})?)\.?\s*$/i);
+  if (crmDealValue) return {
+    tool: "crm", action: "updateLead", params: { leadId: crmDealValue[1], dealValue: Number(crmDealValue[2]!.replaceAll(",", "")) },
+    purpose: "Update only the deal value on the CRM lead ID to the exact amount explicitly supplied by the user."
+  };
+  const crmNote = objective.match(/^\s*(?:please\s+)?add (?:the )?note ["']([^"'\r\n]+)["'] to CRM lead ([A-Za-z0-9._:-]+)\.?\s*$/i);
+  if (crmNote) return {
+    tool: "crm", action: "addLeadNote", params: { leadId: crmNote[2], note: crmNote[1] },
+    purpose: "Add only the exact note explicitly supplied by the user to the identified CRM lead."
+  };
   const event = objective.match(/^\s*(?:please\s+)?create calendar event titled\s+"([^"\r\n]+)"\s+from\s+(\d{4}-\d{2}-\d{2}T[^\s]+)\s+to\s+(\d{4}-\d{2}-\d{2}T[^\s]+)(?:\s+attendees?\s+(.+))?\s*$/i);
   if (event) return { tool: "calendar", action: "createMeeting", params: {
     title: event[1], startTime: event[2], endTime: event[3],
     attendees: event[4] ? event[4].split(/[;,\s]+/).filter(Boolean) : []
   }, purpose: "Create exactly the calendar event requested by the user after approval, then verify Google's returned event." };
   return undefined;
+}
+
+function requestedContactDraft(objective: string): { query: string; subject: string; body: string } | undefined {
+  const draft = objective.match(/^\s*(?:please\s+)?(?:draft|send) email to ([A-Z][A-Za-z'-]*(?:\s+[A-Z][A-Za-z'-]*){0,2})\s+subject\s+"([^"\r\n]+)"\s+body\s+"([\s\S]+)"\s*$/);
+  if (!draft) return undefined;
+  return { query: draft[1]!.trim(), subject: draft[2]!, body: draft[3]! };
 }
 
 /** Builds a tool plan from validated query analysis; legacy callers retain the deterministic planner below. */
@@ -262,6 +286,29 @@ function planStructuredQuery(parsed: ParsedGoal, analysis: AgentPlan, timezone?:
   };
 
   if (analysis.intent === "task_action") {
+    const contactDraft = requestedContactDraft(objective);
+    if (contactDraft) {
+      addCall({
+        tool: "crm", action: "resolveContact", params: { query: contactDraft.query },
+        purpose: "Resolve the named email recipient to one unambiguous CRM contact before preparing any email."
+      });
+      addCall({
+        tool: "email", action: "draftEmail",
+        params: { to: "__RESOLVED_CRM_CONTACT_EMAIL__", subject: contactDraft.subject, body: contactDraft.body },
+        purpose: "Prepare the exact recipient, subject, and body after CRM identity resolution. Creating a draft requires approval; sending it is a separate action and approval.",
+        evidenceRefs: ["crm:resolveContact"],
+        bindResolvedContact: true
+      }, true);
+      return {
+        objective, factsRequired, toolMappings, initialCalls, dependentCalls,
+        downstream: {
+          emailHistoryForCandidates: false, emailAction: "getEmailHistory",
+          calendarAvailabilityForCandidates: false, calendarParams: {},
+          sendFollowUpForCandidates: false, createFollowUpTasksForCandidates: false
+        },
+        finalEvidence: factsRequired
+      };
+    }
     const action = requestedTaskAction(objective) ?? requestedDirectAction(objective);
     if (!action) throw new PlanningError("The request does not contain a complete supported action, so no action was proposed.");
     addCall(action);
@@ -849,10 +896,20 @@ export class ControlledAgentOrchestrator {
         }
         if (resolution.status !== "RESOLVED") continue;
         for (const dependentCall of plan.dependentCalls ?? []) {
-          const dependentParams = dependentCall.tool === "email" || dependentCall.tool === "calendar"
+          const dependentParams = dependentCall.bindResolvedContact && dependentCall.tool === "email" && dependentCall.action === "draftEmail"
+            ? { ...dependentCall.params, to: resolution.entity.email }
+            : dependentCall.tool === "email" || dependentCall.tool === "calendar"
             ? { ...dependentCall.params, leadEmail: resolution.entity.email }
             : dependentCall.params;
-          const dependentResult = await callTool({ ...dependentCall, params: dependentParams });
+          const boundCall: PlannedToolCall = dependentCall.bindResolvedContact
+            ? {
+              ...dependentCall,
+              params: dependentParams,
+              target: { description: `${resolution.entity.canonicalName} <${resolution.entity.email}>` },
+              evidenceRefs: [`crm.resolveContact:${resolution.entity.matchedBy}:${resolution.entity.confidence}`]
+            }
+            : { ...dependentCall, params: dependentParams };
+          const dependentResult = await callTool(boundCall);
           if (!dependentResult.success) {
             stopError = `${dependentCall.tool}.${dependentCall.action} returned ${dependentResult.error.code}`;
             break;

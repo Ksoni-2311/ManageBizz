@@ -93,10 +93,23 @@ export type EvidenceFact = {
 
 export type ActionProposal = {
   id: string;
+  runId: string;
+  goalId: string;
+  stepId: string;
+  actionType: string;
+  target?: { description: string; identityRef?: string };
   riskLevel: string;
   tool: string;
   action: string;
   params: Record<string, unknown>;
+  rationale: string;
+  evidenceRefs: string[];
+  expectedOutcome: string;
+  requiredPermissions: string[];
+  approvalRequired: true;
+  createdAt: string;
+  expiresAt: string;
+  paramsFingerprint: string;
   lifecycle: string;
   approvalStatus: string;
   result?: { success: boolean; data?: unknown; error?: { code: string; message: string } };

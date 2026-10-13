@@ -87,6 +87,18 @@ export function verifiedActionStatement(tool: string, action: string, result: To
   if (!result.success) return undefined;
   if (typeof result.data !== "object" || result.data === null) return undefined;
   const data = result.data as Record<string, unknown>;
+  if (tool === "crm" && action === "updateLead" && data.updated === true && typeof data.lead === "object" && data.lead !== null) {
+    const lead = data.lead as Record<string, unknown>;
+    if (lead.id === params.leadId &&
+        (params.status === undefined || lead.status === params.status) &&
+        (params.dealValue === undefined || lead.dealValue === params.dealValue)) {
+      return "Updated the CRM record with the explicitly requested field values.";
+    }
+  }
+  if (tool === "crm" && action === "addLeadNote" && data.leadId === params.leadId &&
+      typeof data.noteCount === "number" && Number.isInteger(data.noteCount) && data.noteCount > 0) {
+    return "Added the explicitly requested note to the CRM record.";
+  }
   if (tool === "tasks" && (action === "createTask" || action === "completeTask")) {
     if (typeof data.task !== "object" || data.task === null) return undefined;
     const task = data.task as Record<string, unknown>;
@@ -666,11 +678,11 @@ export function buildEvidenceReport(
             ? emptyResultStatement(tool, action, params)
             : tool === "email"
             ? "No matching Gmail messages were found for the CRM-resolved identity in the bounded search."
-            : "No Calendar event with the CRM-resolved identity as an exact attendee was found in the requested date range.",
+            : "No Calendar event with the CRM-resolved identity as an exact attendee was found in the bounded search window.",
           outcome: "EMPTY_RESULT",
           resolutionStatus: "NOT_FOUND",
           recordRefs: [],
-          matchingCriteria: tool === "email" ? ["exact CRM-resolved email participant"] : ["exact attendee email", "requested date range"]
+          matchingCriteria: tool === "email" ? ["exact CRM-resolved email participant"] : ["exact attendee email", "bounded date window"]
         };
       }
       if (tool === "email") {
@@ -752,7 +764,7 @@ export function buildEvidenceReport(
           const ref = safeSourceRef("calendar", "event", event.id);
           return [ref ?? `calendar.event#${eventIndex + 1}`];
         }),
-        matchingCriteria: ["exact attendee email", "requested date range"],
+        matchingCriteria: ["exact attendee email", "bounded date window"],
         sourceMatches: events.flatMap((event) => {
           const recordRef = safeSourceRef("calendar", "event", event.id);
           if (!recordRef) return [];
@@ -761,13 +773,14 @@ export function buildEvidenceReport(
             source: "calendar" as const, recordRef, ...(entityRefForEmail(params) ? { resolvedEntityRef: entityRefForEmail(params)! } : {}),
             matchedBy: "exact_attendee_email", confidence: 1,
             ...(timestamp ? { timestamp } : {}),
-            summary: `Event matched the exact CRM-resolved attendee email within the requested date range${timestamp ? ` at ${timestamp}` : ""}.`,
+            summary: `Event matched the exact CRM-resolved attendee email within the bounded search window${timestamp ? ` at ${timestamp}` : ""}.`,
             ...(normalizedField(event.title, 160) ? { relevantFields: { title: normalizedField(event.title, 160)! } } : {})
           }];
         })
       };
     }
-    if ((tool === "tasks" && (action === "createTask" || action === "completeTask")) ||
+    if ((tool === "crm" && (action === "updateLead" || action === "addLeadNote")) ||
+      (tool === "tasks" && (action === "createTask" || action === "completeTask")) ||
       (tool === "email" && (action === "draftEmail" || action === "sendEmail")) ||
       (tool === "calendar" && action === "createMeeting")) {
       return { evidenceRef, tool, action, statement: `The ${tool} mutation was not confirmed by its returned entity.`, outcome: "SUCCESS_NOT_CONFIRMED" };

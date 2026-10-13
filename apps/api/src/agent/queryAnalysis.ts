@@ -16,14 +16,24 @@ export function deterministicQueryAnalysis(prompt: string, timezone?: string): A
 
   const explicitTaskAction = /\b(?:create|add)\s+(?:a\s+)?task\s+(?:titled|called)\b|\bcomplete\s+task\s+(?:with\s+id\s+)?task-[\w:.-]+/i.test(text);
   const explicitEmailAction = /^\s*(?:please\s+)?(?:draft email to|send (?:the )?email draft)\b/i.test(text);
+  const explicitContactEmailAction = /^\s*(?:please\s+)?(?:draft|send) email to [A-Z][A-Za-z'-]*(?:\s+[A-Z][A-Za-z'-]*){0,2}\s+subject\s+"/.test(text);
+  const explicitCRMAction = /^\s*(?:please\s+)?(?:update CRM lead [A-Za-z0-9._:-]+ (?:status to|deal value to)|add (?:the )?note ["'][^"'\r\n]+["'] to CRM lead [A-Za-z0-9._:-]+)\b/i.test(text);
   const explicitCalendarAction = /^\s*(?:please\s+)?create calendar event titled\b/i.test(text);
 
-  if (explicitTaskAction || explicitEmailAction || explicitCalendarAction) {
+  if (explicitTaskAction || explicitEmailAction || explicitContactEmailAction || explicitCRMAction || explicitCalendarAction) {
     intent = "task_action";
-    sources.add(explicitEmailAction ? "gmail" : explicitCalendarAction ? "calendar" : "tasks");
+    if (explicitContactEmailAction) {
+      sources.add("crm");
+      sources.add("gmail");
+    } else if (explicitEmailAction) sources.add("gmail");
+    else if (explicitCRMAction) sources.add("crm");
+    else if (explicitCalendarAction) sources.add("calendar");
+    else sources.add("tasks");
     requestedFacts = ["the explicitly requested action result"];
     confidence = 0.95;
-    decisionSummary = "The request contains a complete explicit action already supported by the approval workflow.";
+    decisionSummary = explicitContactEmailAction
+      ? "Resolve the named CRM contact before proposing a fully previewed Gmail draft."
+      : "The request contains a complete explicit action already supported by the approval workflow.";
   } else if (/\b(lead|leads|client|clients|prospect|prospects)\b/i.test(text) &&
       /\b(reply|replied|respond|responded|response|answered)\b/i.test(text)) {
     intent = "email_reply_check";
@@ -50,6 +60,19 @@ export function deterministicQueryAnalysis(prompt: string, timezone?: string): A
     requestedFacts = ["the resolved CRM identity", "relevant Gmail context for that identity"];
     confidence = 0.84;
     decisionSummary = "The request asks for a named contact's business context, so CRM identity is resolved before related Gmail retrieval.";
+  } else if (entities.some(({ type }) => type !== "email") &&
+      /\b(relationship|engagement|interactions?)\b|\b(?:current|overall|business)\s+(?:status|context|history)\b/i.test(text)) {
+    intent = "cross_source_contact_status";
+    sources.add("crm");
+    sources.add("gmail");
+    sources.add("calendar");
+    requestedFacts = [
+      "the resolved CRM identity",
+      "relevant Gmail communication for that identity",
+      "Calendar events with that identity as an exact attendee in the bounded default search"
+    ];
+    confidence = 0.74;
+    decisionSummary = "The request asks for broad named-contact business context; resolve the CRM identity before matching communication and calendar evidence.";
   } else if (/\b(reply|replied|respond|responded|response|answered)\b/i.test(text) &&
       /\b(email|mail|proposal|message|reply|replied|respond|responded|response|answered)\b/i.test(text)) {
     intent = "email_reply_check";
@@ -200,29 +223,36 @@ function extractEntities(text: string): AgentPlanDetails["entities"] {
   const phone = !email ? text.match(/(?<!\w)\+?\d[\d ()-]{6,}\d(?!\w)/)?.[0]?.trim() : undefined;
   if (phone && phone.replace(/\D/g, "").length >= 7) entities.push({ type: "phone", value: phone });
 
-  const companyFromDeal = text.match(/\b([A-Z][\w&.-]*(?:\s+[A-Z][\w&.-]*){0,4})['’]s\s+(?:deal|value)\b/)?.[1];
-  const companyWithSuffix = text.match(/\b([A-Z][\w&.-]*(?:\s+[A-Z][\w&.-]*){0,3}\s+(?:Technologies|Technology|Solutions|Systems|Corporation|Company|Inc\.?|LLC|Ltd\.?|Limited|Group))\b/)?.[1];
-  const acronymCompany = text.match(/\b([A-Z]{2,})\s+(?:respond|responded|replied|reply|deal value)\b/)?.[1];
-  const companyInPersonPhrase = text.match(/\bwith\s+[A-Z][a-z]+\s+from\s+([A-Z][\w&.-]*(?:\s+[A-Z][\w&.-]*){0,3})\b/)?.[1];
+  const companyFromDeal = namedEntityCapture(text, /\b([A-Z][\w&.-]*(?:\s+[A-Z][\w&.-]*){0,4})['’]s\s+(?:deal|value)\b/);
+  const companyWithSuffix = namedEntityCapture(text, /\b([A-Z][\w&.-]*(?:\s+[A-Z][\w&.-]*){0,3}\s+(?:Technologies|Technology|Solutions|Systems|Corporation|Company|Inc\.?|LLC|Ltd\.?|Limited|Group))\b/);
+  const acronymCompany = namedEntityCapture(text, /\b([A-Z]{2,})\s+(?:respond|responded|replied|reply|deal value)\b/);
+  const companyInPersonPhrase = namedEntityCapture(text, /\bwith\s+[A-Z][a-z]+\s+from\s+([A-Z][\w&.-]*(?:\s+[A-Z][\w&.-]*){0,3})\b/);
   const company = companyWithSuffix ?? companyInPersonPhrase ?? acronymCompany ??
     (companyFromDeal && (/^[A-Z]{2,}$/.test(companyFromDeal) || /\b(Technologies|Technology|Solutions|Systems|Corporation|Company|Inc\.?|LLC|Ltd\.?|Limited|Group)\b/i.test(companyFromDeal)) ? companyFromDeal : undefined);
   if (company && !email) entities.push({ type: "company", value: company.trim() });
 
   if (!email) {
     const person = (company ? undefined : companyFromDeal)
-      ?? text.match(/\b(?:did|has|have|from|about|for)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2})\s+(?:(?:reply|replied|respond|responded|email|emails|message|messages)\b)/i)?.[1]
-      ?? text.match(/\b(?:email|emails|message|messages)\s+from\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2})\b/)?.[1]
-      ?? text.match(/\bwhat did\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2})\s+(?:say|mention|write|send)\b/i)?.[1]
-      ?? text.match(/\b(?:meeting|meetings|event|events)\s+with\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2})\b/)?.[1]
-      ?? text.match(/\b(?:context|history|deal value|CRM)\s+(?:for|with|of)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2})\b/)?.[1]
-      ?? text.match(/\b(?:with|from)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2})(?:\s+from\s+[A-Z][\w&.-]+)?\b/)?.[1]
-      ?? text.match(/\b(?:find|show|tell me about)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2})\s+(?:in|from)\s+(?:my\s+)?CRM\b/i)?.[1];
+      ?? namedEntityCapture(text, /\b(?:did|has|have|from|about|for)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2})\s+(?:(?:reply|replied|respond|responded|email|emails|message|messages)\b)/i)
+      ?? namedEntityCapture(text, /\b(?:email|emails|message|messages)\s+from\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2})\b/)
+      ?? namedEntityCapture(text, /\b(?:draft|send)\s+email\s+to\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2})\s+subject\b/)
+      ?? namedEntityCapture(text, /\bwhat did\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2})\s+(?:say|mention|write|send)\b/i)
+      ?? namedEntityCapture(text, /\b(?:meeting|meetings|event|events)\s+with\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2})\b/)
+      ?? namedEntityCapture(text, /\b(?:context|history|deal value|CRM)\s+(?:for|with|of)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2})\b/)
+      ?? namedEntityCapture(text, /\b(?:with|from)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2})(?:\s+from\s+[A-Z][\w&.-]+)?\b/)
+      ?? namedEntityCapture(text, /\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2})['’]s\b/)
+      ?? namedEntityCapture(text, /\b(?:find|show|tell me about)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2})\s+(?:in|from)\s+(?:my\s+)?CRM\b/i);
     if (person && !/^(my|the|our|your|their)$/i.test(person) &&
       (!company || person.trim().toLocaleLowerCase("en-US") !== company.trim().toLocaleLowerCase("en-US"))) {
       entities.push({ type: "person", value: person.trim() });
     }
   }
   return entities;
+}
+
+function namedEntityCapture(text: string, pattern: RegExp): string | undefined {
+  const candidate = text.match(pattern)?.[1]?.trim();
+  return candidate && /^[A-Z]/.test(candidate) ? candidate : undefined;
 }
 
 function extractDateRange(text: string, timezone?: string): AgentPlanDetails["dateRange"] {

@@ -89,6 +89,46 @@ export const GroundedAnswerSchema = z.object({
   recommendations: z.array(GroundedRecommendationSchema).max(20)
 }).strict();
 
+export const ActionProposalSchema = z.object({
+  id: z.string().trim().min(1).max(200),
+  runId: z.string().trim().min(1).max(200),
+  goalId: z.string().trim().min(1).max(200),
+  stepId: z.string().trim().min(1).max(200),
+  actionType: z.string().trim().min(1).max(120),
+  tool: z.string().trim().min(1).max(80),
+  action: z.string().trim().min(1).max(80),
+  target: z.object({
+    description: z.string().trim().min(1).max(300),
+    identityRef: z.string().trim().min(1).max(200).optional()
+  }).strict().optional(),
+  params: z.record(z.unknown()),
+  rationale: z.string().trim().min(1).max(500),
+  evidenceRefs: z.array(z.string().trim().min(1).max(200)).max(20),
+  expectedOutcome: z.string().trim().min(1).max(500),
+  requiredPermissions: z.array(z.string().trim().min(1).max(100)).max(10),
+  approvalRequired: z.literal(true),
+  createdAt: z.string().datetime(),
+  expiresAt: z.string().datetime(),
+  paramsFingerprint: z.string().regex(/^[a-f0-9]{64}$/),
+  riskLevel: z.string().trim().min(1).max(50),
+  approvalStatus: z.string().trim().min(1).max(50),
+  lifecycle: z.enum([
+    "PROPOSED", "AWAITING_APPROVAL", "APPROVED", "EXECUTING", "EXECUTED", "COMPLETED",
+    "FAILED", "REJECTED", "EXPIRED", "VERIFYING", "VERIFIED", "VERIFICATION_FAILED"
+  ]),
+  proposedAt: z.string().datetime(),
+  decidedAt: z.string().datetime().optional(),
+  decidedById: z.string().trim().min(1).max(200).optional(),
+  feedback: z.string().max(1_000).optional(),
+  result: z.object({
+    success: z.boolean(),
+    data: z.unknown().optional(),
+    error: z.object({ code: z.string(), message: z.string() }).strict().optional(),
+    metadata: z.record(z.unknown()).optional()
+  }).strict().optional(),
+  verification: z.enum(["PENDING", "VERIFIED", "FAILED"]).optional()
+}).strict();
+
 export const AgentCRMRecordSchema = z.object({
   recordRef: z.string().trim().min(1).max(200),
   name: z.string().trim().min(1).max(200).optional(),
@@ -125,3 +165,4 @@ export type GroundedClaim = z.infer<typeof GroundedClaimSchema>;
 export type GroundedRecommendation = z.infer<typeof GroundedRecommendationSchema>;
 export type EvidenceBundle = z.infer<typeof EvidenceBundleSchema>;
 export type GroundedAnswer = z.infer<typeof GroundedAnswerSchema>;
+export type AgentActionProposal = z.infer<typeof ActionProposalSchema>;
